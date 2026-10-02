@@ -1,6 +1,27 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  async rewrites() {
+    const preview =
+      process.env.NODE_ENV === "development" &&
+      process.env.QUEUE_PREVIEW === "1";
+    return {
+      beforeFiles: preview
+        ? [
+            {
+              source: "/api/metrics",
+              destination: "https://ci.vllm.ai/api/metrics",
+            },
+            {
+              source: "/api/queue/jobs",
+              destination: "https://ci.vllm.ai/api/queue/jobs",
+            },
+          ]
+        : [],
+      afterFiles: [],
+      fallback: [],
+    };
+  },
   async redirects() {
     return [
       {
