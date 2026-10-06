@@ -70,6 +70,16 @@ function buildSlackText(result: RegressionResult, time: string, tz: string): str
   return lines.join("\n");
 }
 
+/** Bump the cron heartbeat so the banner knows the cron is alive. */
+async function touchHeartbeat(db: ReturnType<typeof getDb>) {
+  await db`
+    INSERT INTO alerting_eval_last_notified (id, last_checked_at, updated_at)
+    VALUES (1, now(), now())
+    ON CONFLICT (id) DO UPDATE
+      SET last_checked_at = now(), updated_at = now()
+  `;
+}
+
 export async function GET(request: NextRequest) {
   const cronSecret = process.env.CRON_SECRET;
   if (cronSecret) {
@@ -83,8 +93,10 @@ export async function GET(request: NextRequest) {
     const result = await runRegressionCheck();
     const db = getDb();
 
-    // runRegressionCheck returns null when baseline or candidate can't be
-    // resolved — record an error snapshot so it's visible in the UI.
+    // Always bump heartbeat so the banner can test cron liveness
+    // independently of whether a new snapshot was written.
+    await touchHeartbeat(db);
+
     if (!result) {
       await db`
         INSERT INTO alerting_eval_regression_snapshots
@@ -102,8 +114,8 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Short-circuit when (baseline, candidate) matches the last snapshot —
-    // avoids writing duplicate rows for the same comparison every 6h.
+    // Short-circuit when (baseline, candidate) matches the last snapshot.
+    // The heartbeat was already bumped above, so the banner stays green.
     const lastSnapshot = await db`
       SELECT baseline_image, candidate_image
       FROM alerting_eval_regression_snapshots
@@ -235,7 +247,6 @@ export async function GET(request: NextRequest) {
       const tz = getPacificTzAbbr();
       const dateKey = getPacificDateKey();
 
-      // Read cross-day notification state.
       const lastNotifiedRows = await db`
         SELECT status, regression_keys FROM alerting_eval_last_notified
         WHERE id = 1
@@ -254,6 +265,8 @@ export async function GET(request: NextRequest) {
 
       if (notify) {
         const text = buildSlackText(result, time, tz);
+        const keysArray = [...currentRegressionKeys];
+        let delivered = false;
 
         // Get today's day-row for edit-in-place.
         const summaryRows = await db`
@@ -264,30 +277,36 @@ export async function GET(request: NextRequest) {
           summaryRows.length > 0 ? (summaryRows[0].message_ts as string) : null;
 
         if (messageTs) {
+          // Edit existing day message.
           const updateResult = await updateMessage(messageTs, text, channel);
-          if (!updateResult.ok) {
+          if (updateResult.ok) {
+            delivered = true;
+            const threadText =
+              result.status === "pass"
+                ? `:white_check_mark: All eval checks passed`
+                : `:rotating_light: ${result.summary.regressed} eval regression${result.summary.regressed !== 1 ? "s" : ""} — updated ${time} ${tz}`;
+            const threadResult = await postMessage(threadText, messageTs, channel);
+            if (!threadResult.ok) {
+              console.error("Slack thread reply failed:", threadResult.error);
+            }
+          } else {
             console.error("Slack updateMessage failed:", updateResult.error);
           }
-          const threadText =
-            result.status === "pass"
-              ? `:white_check_mark: All eval checks passed`
-              : `:rotating_light: ${result.summary.regressed} eval regression${result.summary.regressed !== 1 ? "s" : ""} — updated ${time} ${tz}`;
-          const threadResult = await postMessage(threadText, messageTs, channel);
-          if (!threadResult.ok) {
-            console.error("Slack thread reply failed:", threadResult.error);
-          }
         } else {
+          // New day message.
           const posted = await postMessage(text, undefined, channel);
           if (posted.ok && posted.ts) {
             messageTs = posted.ts;
+            delivered = true;
           } else {
             console.error("Slack postMessage failed:", posted.error);
           }
         }
 
-        const keysArray = [...currentRegressionKeys];
-
-        if (messageTs) {
+        // Only persist notification state when Slack actually delivered.
+        // A failed post leaves last_notified unchanged so the next run
+        // retries the notification instead of silently swallowing it.
+        if (delivered && messageTs) {
           await db`
             INSERT INTO alerting_eval_alert_summary
               (id, message_ts, status, regression_keys, created_at, updated_at)
@@ -305,17 +324,16 @@ export async function GET(request: NextRequest) {
               console.error("Slack addReaction failed:", reaction.error);
             }
           }
-        }
 
-        // Persist cross-day notification state.
-        await db`
-          INSERT INTO alerting_eval_last_notified (id, status, regression_keys, updated_at)
-          VALUES (1, ${result.status}, ${JSON.stringify(keysArray)}::jsonb, now())
-          ON CONFLICT (id) DO UPDATE
-            SET status = EXCLUDED.status,
-                regression_keys = EXCLUDED.regression_keys,
-                updated_at = now()
-        `;
+          await db`
+            INSERT INTO alerting_eval_last_notified (id, status, regression_keys, updated_at)
+            VALUES (1, ${result.status}, ${JSON.stringify(keysArray)}::jsonb, now())
+            ON CONFLICT (id) DO UPDATE
+              SET status = EXCLUDED.status,
+                  regression_keys = EXCLUDED.regression_keys,
+                  updated_at = now()
+          `;
+        }
       }
     }
 

@@ -73,11 +73,13 @@ CREATE TABLE IF NOT EXISTS alerting_eval_alert_summary (
 );
 
 -- Carries the last notification state across Pacific days so a new day
--- does not fire a spurious all-clear.  Single row, upserted on notify.
+-- does not fire a spurious all-clear, and a cron heartbeat so the banner
+-- can distinguish "cron alive, data unchanged" from "cron stopped".
 CREATE TABLE IF NOT EXISTS alerting_eval_last_notified (
     id              integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    status          text NOT NULL,
+    status          text,
     regression_keys jsonb NOT NULL DEFAULT '[]'::jsonb,
+    last_checked_at timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 

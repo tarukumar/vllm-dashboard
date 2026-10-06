@@ -16,13 +16,17 @@ const fetcher = <T,>(url: string): Promise<T> =>
 interface EvalAlertsResponse {
   alerts?: EvalRegressionAlert[];
   snapshots?: EvalRegressionSnapshot[];
+  lastCheckedAt?: string | null;
   schemaStatus?: string;
 }
 
-// Two cron cadences (6h each) plus margin. One late run won't flash amber.
+// Two cron cadences (6h each) plus margin.  Tested against the cron
+// heartbeat (last_checked_at), not the snapshot timestamp, so dedupe
+// short-circuits don't trigger false staleness.
 const STALE_THRESHOLD_MS = 13 * 60 * 60 * 1000;
 
-function isStale(checkedAt: string): boolean {
+function isStale(checkedAt: string | null | undefined): boolean {
+  if (!checkedAt) return false;
   const age = Date.now() - new Date(checkedAt).getTime();
   return age > STALE_THRESHOLD_MS;
 }
@@ -47,7 +51,8 @@ export function EvalRegressionBanner() {
 
   if (!latestSnapshot) return null;
 
-  const stale = isStale(latestSnapshot.checked_at);
+  // Staleness tests the cron heartbeat, not the snapshot age.
+  const stale = isStale(data.lastCheckedAt);
   const isPass = latestSnapshot.status === "pass";
   const isSkipped = latestSnapshot.status === "skipped";
   const isError = latestSnapshot.status === "error";
@@ -87,6 +92,9 @@ export function EvalRegressionBanner() {
     icon = "🚨";
     heading = `${s.regressed} eval regression${s.regressed !== 1 ? "s" : ""} detected`;
   }
+
+  const unit = (alert: EvalRegressionAlert) =>
+    alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value);
 
   return (
     <div className={`rounded-xl border px-5 py-4 ${borderClass}`}>
@@ -137,10 +145,11 @@ export function EvalRegressionBanner() {
                 {alert.task}
               </span>
               <span className="text-zinc-500 dark:text-zinc-400">
-                {alert.metric}:                 {fmtMetricValue(alert.baseline_value, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))} →{" "}
-                {fmtMetricValue(alert.candidate_value, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))}{" "}
+                {alert.metric}:{" "}
+                {fmtMetricValue(alert.baseline_value, unit(alert))} →{" "}
+                {fmtMetricValue(alert.candidate_value, unit(alert))}{" "}
                 <span className={deltaColor(alert)}>
-                  ({fmtMetricDelta(alert.delta, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))}
+                  ({fmtMetricDelta(alert.delta, unit(alert))}
                   {alert.significance !== null &&
                     `, ${alert.significance.toFixed(1)}σ`}
                   )

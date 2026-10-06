@@ -12,10 +12,10 @@ export async function GET() {
   try {
     const db = getDb();
 
-    const [alerts, snapshots] = await Promise.all([
+    const [alerts, snapshots, heartbeat] = await Promise.all([
       db<EvalRegressionAlert[]>`
         SELECT alert_id, model, task, n_shot, metric, filter,
-               higher_is_better, status,
+               higher_is_better, unit, status,
                baseline_image, baseline_value,
                candidate_image, candidate_value,
                delta, delta_pct, significance,
@@ -34,10 +34,17 @@ export async function GET() {
         ORDER BY checked_at DESC
         LIMIT ${MAX_SNAPSHOTS}
       `,
+      db`
+        SELECT last_checked_at FROM alerting_eval_last_notified
+        WHERE id = 1
+      `,
     ]);
 
+    const lastCheckedAt: string | null =
+      heartbeat.length > 0 ? (heartbeat[0].last_checked_at as string) : null;
+
     return NextResponse.json(
-      { alerts, snapshots, schemaStatus: "ready" },
+      { alerts, snapshots, lastCheckedAt, schemaStatus: "ready" },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {

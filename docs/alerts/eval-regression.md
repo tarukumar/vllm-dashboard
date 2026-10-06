@@ -92,6 +92,11 @@ the cron run returns early without writing a new snapshot, running episode
 logic, or posting to Slack.  This avoids redundant work when eval data
 changes at most daily but the cron fires every 6h.
 
+The cron heartbeat (`last_checked_at` on `alerting_eval_last_notified`)
+is always bumped — including on short-circuit — so the banner can
+distinguish "cron alive, data unchanged" from "cron stopped firing".
+Staleness is tested against the heartbeat, not against the snapshot age.
+
 ## Integration with perf-eval (Buildkite)
 
 A thin `compare_via_api.py` in the perf-eval repo calls `/api/eval/baseline`
@@ -110,15 +115,18 @@ All tables use the `alerting_` prefix (migration `0023`).
   episode.  Unique constraint on `(model, task, n_shot, metric, filter)
   WHERE status = 'open'` ensures one open episode per eval key.  Stores
   `unit` so old episodes keep the formatting they were reported with.
-- `alerting_eval_regression_snapshots` — one row per cron run (including
-  skipped and error).  `error` snapshots carry a zeroed summary with an
+- `alerting_eval_regression_snapshots` — one row per new `(baseline,
+  candidate)` pair (including skipped and error).  Duplicate pairs are
+  short-circuited.  `error` snapshots carry a zeroed summary with an
   `error` field.  Retained for 30 days (see retention cron).
 - `alerting_eval_alert_summary` — one row per Pacific day: Slack message
   ts, status, and `regression_keys` (for escalation detection within the
   same day message).
 - `alerting_eval_last_notified` — single row carrying notification state
-  across Pacific days (status + regression key set).  Prevents spurious
-  daily all-clear messages.
+  across Pacific days (status + regression key set) and cron heartbeat
+  (`last_checked_at`).  Prevents spurious daily all-clear messages.
+  Notification state is only updated on successful Slack delivery — a
+  failed post leaves it unchanged so the next run retries.
 
 ## Dashboard views
 
