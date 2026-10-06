@@ -1,26 +1,34 @@
 import useSWR from "swr";
-import { formatRelativeTime } from "@/lib/alerts-shared";
+import {
+  formatRelativeTime,
+  fmtMetricValue,
+  fmtMetricDelta,
+} from "@/lib/alerts-shared";
 import type {
-  EvalRegressionSnapshotRow,
-  EvalRegressionAlertRow,
-} from "@/app/api/alerts/eval/route";
+  EvalRegressionAlert,
+  EvalRegressionSnapshot,
+} from "@/lib/eval-alert-types";
 
 const fetcher = <T,>(url: string): Promise<T> =>
   fetch(url).then((r) => r.json());
 
 interface EvalAlertsResponse {
-  alerts?: EvalRegressionAlertRow[];
-  snapshots?: EvalRegressionSnapshotRow[];
+  alerts?: EvalRegressionAlert[];
+  snapshots?: EvalRegressionSnapshot[];
   schemaStatus?: string;
 }
 
-function fmtPct(v: number): string {
-  return `${(v * 100).toFixed(2)}%`;
+const STALE_THRESHOLD_MS = 7 * 60 * 60 * 1000;
+
+function isStale(checkedAt: string): boolean {
+  const age = Date.now() - new Date(checkedAt).getTime();
+  return age > STALE_THRESHOLD_MS;
 }
 
-function fmtDelta(d: number): string {
-  const sign = d >= 0 ? "+" : "";
-  return `${sign}${(d * 100).toFixed(2)}pp`;
+function deltaColor(alert: EvalRegressionAlert): string {
+  const beneficial = alert.higher_is_better ? alert.delta : -alert.delta;
+  if (beneficial < 0) return "font-medium text-red-600 dark:text-red-400";
+  return "font-medium text-emerald-600 dark:text-emerald-400";
 }
 
 export function EvalRegressionBanner() {
@@ -37,45 +45,62 @@ export function EvalRegressionBanner() {
 
   if (!latestSnapshot) return null;
 
+  const stale = isStale(latestSnapshot.checked_at);
   const isPass = latestSnapshot.status === "pass";
+  const isSkipped = latestSnapshot.status === "skipped";
   const s = latestSnapshot.summary;
 
+  const borderClass = stale
+    ? "border-amber-200/80 bg-amber-50/50 dark:border-amber-900/50 dark:bg-amber-950/20"
+    : isPass
+      ? "border-emerald-200/80 bg-emerald-50/50 dark:border-emerald-900/50 dark:bg-emerald-950/20"
+      : isSkipped
+        ? "border-zinc-200/80 bg-zinc-50/50 dark:border-zinc-800/50 dark:bg-zinc-950/20"
+        : "border-red-200/80 bg-red-50/50 dark:border-red-900/50 dark:bg-red-950/20";
+
+  const headingClass = stale
+    ? "text-amber-800 dark:text-amber-200"
+    : isPass
+      ? "text-emerald-800 dark:text-emerald-200"
+      : isSkipped
+        ? "text-zinc-600 dark:text-zinc-400"
+        : "text-red-800 dark:text-red-200";
+
+  let icon: string;
+  let heading: string;
+  if (stale) {
+    icon = "⚠️";
+    heading = "Eval regression check is stale";
+  } else if (isSkipped) {
+    icon = "⏭️";
+    heading = "Eval check skipped — no candidate data";
+  } else if (isPass) {
+    icon = "✅";
+    heading = "All eval checks passed";
+  } else {
+    icon = "🚨";
+    heading = `${s.regressed} eval regression${s.regressed !== 1 ? "s" : ""} detected`;
+  }
+
   return (
-    <div
-      className={`rounded-xl border px-5 py-4 ${
-        isPass
-          ? "border-emerald-200/80 bg-emerald-50/50 dark:border-emerald-900/50 dark:bg-emerald-950/20"
-          : "border-red-200/80 bg-red-50/50 dark:border-red-900/50 dark:bg-red-950/20"
-      }`}
-    >
+    <div className={`rounded-xl border px-5 py-4 ${borderClass}`}>
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-lg">
-              {isPass ? "✅" : "🚨"}
-            </span>
-            <h3
-              className={`text-sm font-semibold ${
-                isPass
-                  ? "text-emerald-800 dark:text-emerald-200"
-                  : "text-red-800 dark:text-red-200"
-              }`}
-            >
-              {isPass
-                ? "All eval checks passed"
-                : `${s.regressed} eval regression${s.regressed !== 1 ? "s" : ""} detected`}
+            <span className="text-lg">{icon}</span>
+            <h3 className={`text-sm font-semibold ${headingClass}`}>
+              {heading}
             </h3>
           </div>
           <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
             {latestSnapshot.baseline_image} vs {latestSnapshot.candidate_image}
             {" · "}
             checked {formatRelativeTime(latestSnapshot.checked_at)}
-            {" · "}
-            {s.total} metrics, {s.regressed} regressed, {s.improved} improved
+            {!isSkipped && ` · ${s.total} metrics, ${s.regressed} regressed, ${s.improved} improved`}
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
-          {latestSnapshot.compare_url && (
+          {latestSnapshot.compare_url && !isSkipped && (
             <a
               href={latestSnapshot.compare_url}
               target="_blank"
@@ -94,7 +119,6 @@ export function EvalRegressionBanner() {
         </div>
       </div>
 
-      {/* Show open regressions inline */}
       {openAlerts.length > 0 && (
         <div className="mt-3 space-y-1 border-t border-red-200/60 pt-3 dark:border-red-900/40">
           {openAlerts.slice(0, 5).map((alert) => (
@@ -107,10 +131,10 @@ export function EvalRegressionBanner() {
                 {alert.task}
               </span>
               <span className="text-zinc-500 dark:text-zinc-400">
-                {alert.metric}: {fmtPct(alert.baseline_value)} →{" "}
-                {fmtPct(alert.candidate_value)}{" "}
-                <span className="font-medium text-red-600 dark:text-red-400">
-                  ({fmtDelta(alert.delta)}
+                {alert.metric}: {fmtMetricValue(alert.baseline_value, "score")} →{" "}
+                {fmtMetricValue(alert.candidate_value, "score")}{" "}
+                <span className={deltaColor(alert)}>
+                  ({fmtMetricDelta(alert.delta, "score")}
                   {alert.significance !== null &&
                     `, ${alert.significance.toFixed(1)}σ`}
                   )

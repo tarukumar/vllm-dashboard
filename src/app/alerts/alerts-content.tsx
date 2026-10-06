@@ -22,9 +22,9 @@ import {
 } from "@/lib/alerts-main-ci";
 import { EvalAlerts } from "@/components/eval-alerts";
 import type {
-  EvalRegressionAlertRow,
-  EvalRegressionSnapshotRow,
-} from "@/app/api/alerts/eval/route";
+  EvalRegressionAlert,
+  EvalRegressionSnapshot,
+} from "@/lib/eval-alert-types";
 import {
   ALERT_TIME_WINDOWS,
   alertWindowCutoff,
@@ -72,7 +72,7 @@ const ALERT_TABS: readonly {
     value: "eval",
     label: "Eval regressions",
     description:
-      "Accuracy evaluation regressions detected by comparing the latest nightly image against the most recent release baseline. A regression opens when a metric drops beyond the statistical threshold (2σ) and resolves when a later check shows recovery. Checks run on a schedule and after each perf-eval ingestion.",
+      "Accuracy evaluation regressions detected by comparing the latest nightly image against the most recent release baseline. A regression opens when a metric drops beyond the statistical threshold (2σ) and resolves when a later check positively shows recovery. Missing data does not open or resolve episodes. Checks run every six hours.",
   },
 ];
 
@@ -163,8 +163,8 @@ interface InfraAlertsResponse {
 }
 
 interface EvalAlertsResponse {
-  alerts?: EvalRegressionAlertRow[];
-  snapshots?: EvalRegressionSnapshotRow[];
+  alerts?: EvalRegressionAlert[];
+  snapshots?: EvalRegressionSnapshot[];
   schemaStatus?: "ready" | "pending";
   error?: string;
 }
@@ -480,8 +480,8 @@ function EvalSection() {
     >
       {data?.schemaStatus === "pending" ? (
         <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-amber-300 px-6 text-center text-sm text-amber-700 dark:border-amber-800 dark:text-amber-300">
-          Backend rollout pending. Migration 0023 must be deployed before
-          this preview can show eval regression alerts.
+          Backend rollout pending. Migration 0023 and the eval regression
+          cron must be deployed before this preview can show alerts.
         </div>
       ) : (
         <EvalAlerts

@@ -4,6 +4,10 @@
  * The baseline is the latest release image that has eval data, unless a
  * specific image is requested.  No static YAML — the baseline always comes
  * from the data warehouse.
+ *
+ * All resolution functions accept a pre-loaded row set to avoid redundant
+ * Databricks scans.  The cron path calls loadEvalRows() once and threads
+ * the result through.
  */
 
 import { loadEvalRows, type EvalRow, type EvalMetric } from "@/lib/eval-data";
@@ -34,10 +38,6 @@ export interface EvalBaseline {
   metrics: BaselineMetric[];
 }
 
-/**
- * Build a composite key for deduplication: one value per
- * (model, task, metric, filter) combination, keeping the latest run.
- */
 function baselineKey(
   model: string,
   task: string,
@@ -85,20 +85,14 @@ function extractMetrics(rows: EvalRow[]): BaselineMetric[] {
   );
 }
 
-/**
- * Find the latest release image that has eval data.
- *
- * Loads all eval rows, groups their images by kind, and picks the first
- * (newest) release.  Returns null when no release image has eval data.
- */
-async function resolveLatestReleaseImage(): Promise<string | null> {
-  const allRows = await loadEvalRows();
+/** Build epoch-keyed date map and grouped images from a row set. */
+function groupRows(rows: EvalRow[]) {
   const images = [...new Set(
-    allRows.map((r) => r.image).filter((img): img is string => img !== null),
+    rows.map((r) => r.image).filter((img): img is string => img !== null),
   )];
 
   const epochByImage = new Map<string, number>();
-  for (const row of allRows) {
+  for (const row of rows) {
     if (!row.image) continue;
     const prev = epochByImage.get(row.image) ?? 0;
     if (row.run_epoch > prev) epochByImage.set(row.image, row.run_epoch);
@@ -109,54 +103,62 @@ async function resolveLatestReleaseImage(): Promise<string | null> {
     dates[img] = new Date(epoch * 1000).toISOString();
   }
 
-  const groups = groupImagesByKind(images, dates);
+  return { images, dates, groups: groupImagesByKind(images, dates) };
+}
+
+/**
+ * Find the latest release image from a pre-loaded row set.
+ * Pass `allRows` to avoid a redundant Databricks scan.
+ */
+export function resolveLatestReleaseImageFromRows(
+  allRows: EvalRow[],
+): string | null {
+  const { groups } = groupRows(allRows);
   return groups.release[0] ?? null;
 }
 
 /**
- * Find the latest nightly image that has eval data.
+ * Find the latest nightly image from a pre-loaded row set.
+ * Pass `allRows` to avoid a redundant Databricks scan.
+ */
+export function resolveLatestNightlyImageFromRows(
+  allRows: EvalRow[],
+): string | null {
+  const { groups } = groupRows(allRows);
+  return groups.nightly[0] ?? null;
+}
+
+/**
+ * Convenience wrappers that load rows on demand (used by the baseline API
+ * endpoint, not by the cron path).
  */
 export async function resolveLatestNightlyImage(): Promise<string | null> {
-  const allRows = await loadEvalRows();
-  const images = [...new Set(
-    allRows.map((r) => r.image).filter((img): img is string => img !== null),
-  )];
-
-  const epochByImage = new Map<string, number>();
-  for (const row of allRows) {
-    if (!row.image) continue;
-    const prev = epochByImage.get(row.image) ?? 0;
-    if (row.run_epoch > prev) epochByImage.set(row.image, row.run_epoch);
-  }
-
-  const dates: Record<string, string> = {};
-  for (const [img, epoch] of epochByImage) {
-    dates[img] = new Date(epoch * 1000).toISOString();
-  }
-
-  const groups = groupImagesByKind(images, dates);
-  return groups.nightly[0] ?? null;
+  return resolveLatestNightlyImageFromRows(await loadEvalRows());
 }
 
 /**
  * Resolve the eval baseline.
  *
- * @param image  Explicit baseline image.  When omitted, the latest release
- *               image with eval data is used.
+ * @param image     Explicit baseline image.  When omitted, the latest
+ *                  release image with eval data is used.
+ * @param allRows   Pre-loaded rows to avoid a redundant Databricks scan.
+ *                  When omitted, rows are loaded on demand.
  */
 export async function resolveEvalBaseline(
   image?: string | null,
+  allRows?: EvalRow[],
 ): Promise<EvalBaseline | null> {
-  const baselineImage = image || await resolveLatestReleaseImage();
+  const rows = allRows ?? await loadEvalRows();
+  const baselineImage = image || resolveLatestReleaseImageFromRows(rows);
   if (!baselineImage) return null;
 
-  const rows = await loadEvalRows({ image: baselineImage });
-  if (rows.length === 0) return null;
+  const baselineRows = rows.filter((r) => r.image === baselineImage);
+  if (baselineRows.length === 0) return null;
 
   return {
     baselineImage,
     imageInfo: classifyImage(baselineImage),
     resolvedAt: new Date().toISOString(),
-    metrics: extractMetrics(rows),
+    metrics: extractMetrics(baselineRows),
   };
 }

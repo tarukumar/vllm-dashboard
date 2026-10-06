@@ -1,23 +1,34 @@
 /**
- * Eval regression detection.
+ * Regression detection for eval accuracy benchmarks (lm_eval + BFCL).
  *
  * Compares the latest nightly eval results against a dynamic baseline
- * (latest release image) and classifies each metric as pass, regression,
- * improvement, noisy, or missing.
+ * (latest release image).  Missing data (no candidate rows, total === 0)
+ * is treated as no evidence — it never opens or resolves an episode.
  */
 
 import { loadEvalRows } from "@/lib/eval-data";
 import { compareEvalRows, type DeltaItem } from "@/lib/compare";
 import {
   resolveEvalBaseline,
-  resolveLatestNightlyImage,
+  resolveLatestNightlyImageFromRows,
   type EvalBaseline,
 } from "@/lib/eval-baseline";
 import { describeImage } from "@/lib/commit-from-image";
 
-export type RegressionStatus = "pass" | "regression";
+export type RegressionStatus = "pass" | "regression" | "skipped";
 
-export interface EvalRegressionResult {
+export interface RegressionSummary {
+  total: number;
+  passed: number;
+  regressed: number;
+  improved: number;
+  noisy: number;
+  unchanged: number;
+  missingBaseline: number;
+  missingCandidate: number;
+}
+
+export interface RegressionResult {
   status: RegressionStatus;
   baselineImage: string;
   baselineLabel: string;
@@ -25,20 +36,54 @@ export interface EvalRegressionResult {
   candidateLabel: string;
   evalSigma: number;
   checkedAt: string;
-  summary: {
-    total: number;
-    passed: number;
-    regressed: number;
-    improved: number;
-    noisy: number;
-    unchanged: number;
-    missingBaseline: number;
-    missingCandidate: number;
-  };
+  summary: RegressionSummary;
   regressions: DeltaItem[];
   improvements: DeltaItem[];
   allDeltas: DeltaItem[];
   compareUrl: string;
+}
+
+/**
+ * Pure classification over a list of deltas.  Exported for testing.
+ *
+ * Returns "skipped" when there is no evidence (total === 0 or missing
+ * candidate data dominates).  This prevents empty runs from resolving
+ * open episodes or posting all-clear messages.
+ */
+export function classifyDeltas(
+  deltas: DeltaItem[],
+  missingCandidate: number,
+): { status: RegressionStatus; summary: RegressionSummary } {
+  const regressions = deltas.filter((d) => d.status === "regression");
+  const improvements = deltas.filter((d) => d.status === "improvement");
+  const noisy = deltas.filter((d) => d.status === "noisy");
+  const unchanged = deltas.filter((d) => d.status === "unchanged");
+
+  const total = deltas.length;
+  const hasEvidence = total > 0 && missingCandidate === 0;
+
+  let status: RegressionStatus;
+  if (!hasEvidence) {
+    status = "skipped";
+  } else if (regressions.length > 0) {
+    status = "regression";
+  } else {
+    status = "pass";
+  }
+
+  return {
+    status,
+    summary: {
+      total,
+      passed: unchanged.length + noisy.length + improvements.length,
+      regressed: regressions.length,
+      improved: improvements.length,
+      noisy: noisy.length,
+      unchanged: unchanged.length,
+      missingBaseline: 0,
+      missingCandidate,
+    },
+  };
 }
 
 function buildCompareUrl(
@@ -51,42 +96,49 @@ function buildCompareUrl(
 }
 
 export interface RunRegressionCheckOpts {
-  /** Explicit baseline image; auto-resolves to latest release when omitted. */
   baselineImage?: string | null;
-  /** Explicit candidate image; auto-resolves to latest nightly when omitted. */
   candidateImage?: string | null;
-  /** Sigma threshold for eval regression classification.  Default: 2. */
   evalSigma?: number;
-  /** Dashboard base URL for compare links.  Default: https://ci.vllm.ai */
   dashboardUrl?: string;
 }
 
 /**
- * Run a full regression check: resolve baseline and candidate, load eval
- * rows for both, compare, and classify.
+ * Run a full regression check.  Returns null only when baseline or
+ * candidate image cannot be resolved at all.
  *
- * Returns null when baseline or candidate cannot be resolved.
+ * Uses a single loadEvalRows() call for baseline resolution, nightly
+ * resolution, and comparison — avoiding redundant Databricks scans.
  */
 export async function runRegressionCheck(
   opts: RunRegressionCheckOpts = {},
-): Promise<EvalRegressionResult | null> {
+): Promise<RegressionResult | null> {
   const evalSigma = opts.evalSigma ?? 2;
-  const dashboardUrl = opts.dashboardUrl ?? "https://ci.vllm.ai";
+  const dashboardUrl =
+    opts.dashboardUrl ??
+    process.env.DASHBOARD_BASE_URL ??
+    "https://ci.vllm.ai";
 
+  // Single Databricks load: all eval rows, unfiltered.
+  const allRows = await loadEvalRows();
+
+  // Resolve baseline from the loaded rows.
   const baseline: EvalBaseline | null = await resolveEvalBaseline(
     opts.baselineImage,
+    allRows,
   );
   if (!baseline) return null;
 
+  // Resolve candidate from the loaded rows.
   const candidateImage =
-    opts.candidateImage || (await resolveLatestNightlyImage());
+    opts.candidateImage || resolveLatestNightlyImageFromRows(allRows);
   if (!candidateImage) return null;
-
   if (candidateImage === baseline.baselineImage) return null;
 
-  const evalRows = await loadEvalRows({
-    images: [baseline.baselineImage, candidateImage],
-  });
+  // Filter to the two images for comparison (in memory, no extra scan).
+  const imageSet = new Set([baseline.baselineImage, candidateImage]);
+  const evalRows = allRows.filter(
+    (r) => r.image !== null && imageSet.has(r.image),
+  );
 
   const evalResult = compareEvalRows(
     evalRows,
@@ -95,17 +147,18 @@ export async function runRegressionCheck(
     evalSigma,
   );
 
-  const regressions = evalResult.deltas.filter(
-    (d) => d.status === "regression",
+  const { status, summary } = classifyDeltas(
+    evalResult.deltas,
+    evalResult.missingCandidate.length,
   );
-  const improvements = evalResult.deltas.filter(
-    (d) => d.status === "improvement",
-  );
-  const noisy = evalResult.deltas.filter((d) => d.status === "noisy");
-  const unchanged = evalResult.deltas.filter((d) => d.status === "unchanged");
+  summary.missingBaseline = evalResult.missingBaseline.length;
 
-  const status: RegressionStatus =
-    regressions.length > 0 ? "regression" : "pass";
+  const regressions = evalResult.deltas
+    .filter((d) => d.status === "regression")
+    .sort((a, b) => b.severity - a.severity);
+  const improvements = evalResult.deltas
+    .filter((d) => d.status === "improvement")
+    .sort((a, b) => b.severity - a.severity);
 
   return {
     status,
@@ -115,19 +168,9 @@ export async function runRegressionCheck(
     candidateLabel: describeImage(candidateImage),
     evalSigma,
     checkedAt: new Date().toISOString(),
-    summary: {
-      total: evalResult.deltas.length,
-      passed:
-        unchanged.length + noisy.length + improvements.length,
-      regressed: regressions.length,
-      improved: improvements.length,
-      noisy: noisy.length,
-      unchanged: unchanged.length,
-      missingBaseline: evalResult.missingBaseline.length,
-      missingCandidate: evalResult.missingCandidate.length,
-    },
-    regressions: regressions.sort((a, b) => b.severity - a.severity),
-    improvements: improvements.sort((a, b) => b.severity - a.severity),
+    summary,
+    regressions,
+    improvements,
     allDeltas: evalResult.deltas,
     compareUrl: buildCompareUrl(
       dashboardUrl,

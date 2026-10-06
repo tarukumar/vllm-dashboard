@@ -39,6 +39,10 @@ export async function GET(request: NextRequest) {
       DELETE FROM buildkite_agent_snapshots
       WHERE polled_at < NOW() - INTERVAL '30 days'
     `;
+    const evalSnapshotsDeleted = await db`
+      DELETE FROM alerting_eval_regression_snapshots
+      WHERE checked_at < NOW() - INTERVAL '30 days'
+    `.catch(() => ({ count: 0 }));
 
     return NextResponse.json({
       ok: true,
@@ -46,6 +50,7 @@ export async function GET(request: NextRequest) {
       gpuSnapshotsDeleted: gpuDeleted.count,
       hostSnapshotsDeleted: hostDeleted.count,
       agentSnapshotsDeleted: agentDeleted.count,
+      evalSnapshotsDeleted: evalSnapshotsDeleted.count,
     });
   } catch (error) {
     console.error("Retention failed:", error);

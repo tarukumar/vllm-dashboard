@@ -1,8 +1,13 @@
-import { formatAlertDateTime, formatRelativeTime } from "@/lib/alerts-shared";
+import {
+  formatAlertDateTime,
+  formatRelativeTime,
+  fmtMetricValue,
+  fmtMetricDelta,
+} from "@/lib/alerts-shared";
 import type {
-  EvalRegressionAlertRow,
-  EvalRegressionSnapshotRow,
-} from "@/app/api/alerts/eval/route";
+  EvalRegressionAlert,
+  EvalRegressionSnapshot,
+} from "@/lib/eval-alert-types";
 
 function StatusBadge({ status }: { status: "open" | "resolved" }) {
   return status === "open" ? (
@@ -16,28 +21,36 @@ function StatusBadge({ status }: { status: "open" | "resolved" }) {
   );
 }
 
-function CheckStatusBadge({ status }: { status: "pass" | "regression" }) {
-  return status === "pass" ? (
-    <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
-      Pass
-    </span>
-  ) : (
+function CheckStatusBadge({ status }: { status: "pass" | "regression" | "skipped" }) {
+  if (status === "pass") {
+    return (
+      <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+        Pass
+      </span>
+    );
+  }
+  if (status === "skipped") {
+    return (
+      <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+        Skipped
+      </span>
+    );
+  }
+  return (
     <span className="shrink-0 rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700 dark:bg-red-950/60 dark:text-red-300">
       Regression
     </span>
   );
 }
 
-function fmtPct(v: number): string {
-  return `${(v * 100).toFixed(2)}%`;
+function deltaColor(alert: EvalRegressionAlert): string {
+  const beneficial = alert.higher_is_better ? alert.delta : -alert.delta;
+  if (beneficial < 0) return "font-medium text-red-600 dark:text-red-400";
+  return "font-medium text-emerald-600 dark:text-emerald-400";
 }
 
-function fmtDelta(d: number): string {
-  const sign = d >= 0 ? "+" : "";
-  return `${sign}${(d * 100).toFixed(2)}pp`;
-}
-
-function AlertRow({ alert }: { alert: EvalRegressionAlertRow }) {
+function AlertRow({ alert }: { alert: EvalRegressionAlert }) {
+  const unit = "score";
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-sm sm:px-5">
       <div className="min-w-0 flex-1">
@@ -46,22 +59,16 @@ function AlertRow({ alert }: { alert: EvalRegressionAlertRow }) {
             {alert.task}
           </span>
           <span className="text-xs text-zinc-500 dark:text-zinc-400">
-            {alert.metric}
+            {alert.metric} · {alert.n_shot}-shot
           </span>
           <StatusBadge status={alert.status} />
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           <span className="font-mono">{alert.model}</span>
           <span>
-            {fmtPct(alert.baseline_value)} → {fmtPct(alert.candidate_value)}{" "}
-            <span
-              className={
-                alert.delta < 0
-                  ? "font-medium text-red-600 dark:text-red-400"
-                  : "font-medium text-emerald-600 dark:text-emerald-400"
-              }
-            >
-              ({fmtDelta(alert.delta)}
+            {fmtMetricValue(alert.baseline_value, unit)} → {fmtMetricValue(alert.candidate_value, unit)}{" "}
+            <span className={deltaColor(alert)}>
+              ({fmtMetricDelta(alert.delta, unit)}
               {alert.significance !== null &&
                 `, ${alert.significance.toFixed(1)}σ`}
               )
@@ -78,18 +85,20 @@ function AlertRow({ alert }: { alert: EvalRegressionAlertRow }) {
   );
 }
 
-function SnapshotRow({ snapshot }: { snapshot: EvalRegressionSnapshotRow }) {
+function SnapshotRow({ snapshot }: { snapshot: EvalRegressionSnapshot }) {
   const s = snapshot.summary;
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm sm:px-5">
       <CheckStatusBadge status={snapshot.status} />
       <span className="text-xs text-zinc-500 dark:text-zinc-400">
-        {s.total} metrics · {s.regressed} regressed · {s.improved} improved
+        {snapshot.status === "skipped"
+          ? "No candidate data"
+          : `${s.total} metrics · ${s.regressed} regressed · ${s.improved} improved`}
       </span>
       <span className="ml-auto shrink-0 font-mono text-xs text-zinc-400">
         {formatRelativeTime(snapshot.checked_at)}
       </span>
-      {snapshot.compare_url && (
+      {snapshot.compare_url && snapshot.status !== "skipped" && (
         <a
           href={snapshot.compare_url}
           target="_blank"
@@ -107,15 +116,14 @@ export function EvalAlerts({
   alerts,
   snapshots,
 }: {
-  alerts: EvalRegressionAlertRow[];
-  snapshots: EvalRegressionSnapshotRow[];
+  alerts: EvalRegressionAlert[];
+  snapshots: EvalRegressionSnapshot[];
 }) {
   const openAlerts = alerts.filter((a) => a.status === "open");
   const resolvedAlerts = alerts.filter((a) => a.status === "resolved");
 
   return (
     <div className="space-y-4">
-      {/* Latest check result */}
       {snapshots.length > 0 && (
         <div className="overflow-hidden rounded-xl border border-zinc-200/80 bg-white dark:border-zinc-800/80 dark:bg-zinc-950">
           <div className="border-b border-zinc-200 px-4 py-3 sm:px-5 dark:border-zinc-800">
@@ -131,7 +139,6 @@ export function EvalAlerts({
         </div>
       )}
 
-      {/* Open regressions */}
       <div className="overflow-hidden rounded-xl border border-zinc-200/80 bg-white dark:border-zinc-800/80 dark:bg-zinc-950">
         <div className="border-b border-zinc-200 px-4 py-3 sm:px-5 dark:border-zinc-800">
           <h3 className="text-[13px] font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">
@@ -151,7 +158,6 @@ export function EvalAlerts({
         )}
       </div>
 
-      {/* Recently resolved */}
       {resolvedAlerts.length > 0 && (
         <div className="overflow-hidden rounded-xl border border-zinc-200/80 bg-white dark:border-zinc-800/80 dark:bg-zinc-950">
           <div className="border-b border-zinc-200 px-4 py-3 sm:px-5 dark:border-zinc-800">

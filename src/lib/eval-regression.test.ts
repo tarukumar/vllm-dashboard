@@ -1,94 +1,104 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { classifyDeltas } from "./eval-regression";
+import type { DeltaItem } from "./compare";
 
-/**
- * Unit tests for the regression result shape and classification.
- *
- * The actual Databricks-dependent comparison logic is tested via the
- * compare.ts tests; here we verify the aggregation and status
- * classification that eval-regression.ts applies on top.
- */
-
-interface DeltaLike {
-  status: string;
-  severity: number;
-  key: string;
-}
-
-interface Summary {
-  total: number;
-  passed: number;
-  regressed: number;
-  improved: number;
-  noisy: number;
-  unchanged: number;
-}
-
-function classifyResult(deltas: DeltaLike[]): {
-  status: "pass" | "regression";
-  summary: Summary;
-} {
-  const regressions = deltas.filter((d) => d.status === "regression");
-  const improvements = deltas.filter((d) => d.status === "improvement");
-  const noisy = deltas.filter((d) => d.status === "noisy");
-  const unchanged = deltas.filter((d) => d.status === "unchanged");
+function makeDelta(overrides: Partial<DeltaItem>): DeltaItem {
   return {
-    status: regressions.length > 0 ? "regression" : "pass",
-    summary: {
-      total: deltas.length,
-      passed: unchanged.length + noisy.length + improvements.length,
-      regressed: regressions.length,
-      improved: improvements.length,
-      noisy: noisy.length,
-      unchanged: unchanged.length,
-    },
+    area: "eval",
+    key: "test|gsm8k|0|exact_match|flexible-extract",
+    model: "Qwen/Qwen3-5-32B",
+    dimension: "gsm8k - 0-shot - flexible-extract",
+    metric: "exact_match",
+    metricLabel: "exact_match (flexible-extract)",
+    unit: "score",
+    higherIsBetter: true,
+    baselineValue: 0.87,
+    candidateValue: 0.85,
+    delta: -0.02,
+    deltaPct: -0.023,
+    status: "unchanged",
+    severity: 0.02,
+    significance: 1.5,
+    baselineRun: "2026-09-10T00:00:00Z",
+    candidateRun: "2026-10-01T00:00:00Z",
+    baselineDetail: "n=1319 - abc1234",
+    candidateDetail: "n=1319 - def5678",
+    ...overrides,
   };
 }
 
 test("classifies as pass when no regressions", () => {
-  const result = classifyResult([
-    { status: "unchanged", severity: 0.01, key: "k1" },
-    { status: "improvement", severity: 0.03, key: "k2" },
-  ]);
-  assert.equal(result.status, "pass");
-  assert.equal(result.summary.regressed, 0);
-  assert.equal(result.summary.passed, 2);
+  const { status, summary } = classifyDeltas(
+    [
+      makeDelta({ status: "unchanged", key: "k1" }),
+      makeDelta({ status: "improvement", key: "k2" }),
+    ],
+    0,
+  );
+  assert.equal(status, "pass");
+  assert.equal(summary.regressed, 0);
+  assert.equal(summary.passed, 2);
 });
 
 test("classifies as regression when any delta is a regression", () => {
-  const result = classifyResult([
-    { status: "regression", severity: 0.05, key: "k1" },
-    { status: "unchanged", severity: 0.01, key: "k2" },
-  ]);
-  assert.equal(result.status, "regression");
-  assert.equal(result.summary.regressed, 1);
-  assert.equal(result.summary.passed, 1);
+  const { status, summary } = classifyDeltas(
+    [
+      makeDelta({ status: "regression", key: "k1" }),
+      makeDelta({ status: "unchanged", key: "k2" }),
+    ],
+    0,
+  );
+  assert.equal(status, "regression");
+  assert.equal(summary.regressed, 1);
+  assert.equal(summary.passed, 1);
 });
 
 test("counts noisy as passed, not regressed", () => {
-  const result = classifyResult([
-    { status: "noisy", severity: 0.02, key: "k1" },
-  ]);
-  assert.equal(result.status, "pass");
-  assert.equal(result.summary.noisy, 1);
-  assert.equal(result.summary.passed, 1);
-  assert.equal(result.summary.regressed, 0);
+  const { status, summary } = classifyDeltas(
+    [makeDelta({ status: "noisy", key: "k1" })],
+    0,
+  );
+  assert.equal(status, "pass");
+  assert.equal(summary.noisy, 1);
+  assert.equal(summary.passed, 1);
+  assert.equal(summary.regressed, 0);
 });
 
 test("multiple regressions are all counted", () => {
-  const result = classifyResult([
-    { status: "regression", severity: 0.02, key: "k1" },
-    { status: "regression", severity: 0.05, key: "k2" },
-    { status: "unchanged", severity: 0, key: "k3" },
-  ]);
-  assert.equal(result.status, "regression");
-  assert.equal(result.summary.regressed, 2);
-  assert.equal(result.summary.total, 3);
+  const { status, summary } = classifyDeltas(
+    [
+      makeDelta({ status: "regression", severity: 0.02, key: "k1" }),
+      makeDelta({ status: "regression", severity: 0.05, key: "k2" }),
+      makeDelta({ status: "unchanged", severity: 0, key: "k3" }),
+    ],
+    0,
+  );
+  assert.equal(status, "regression");
+  assert.equal(summary.regressed, 2);
+  assert.equal(summary.total, 3);
 });
 
-test("empty deltas classify as pass", () => {
-  const result = classifyResult([]);
-  assert.equal(result.status, "pass");
-  assert.equal(result.summary.total, 0);
-  assert.equal(result.summary.regressed, 0);
+test("empty deltas classify as skipped", () => {
+  const { status, summary } = classifyDeltas([], 0);
+  assert.equal(status, "skipped");
+  assert.equal(summary.total, 0);
+  assert.equal(summary.regressed, 0);
+});
+
+test("missing candidate data classifies as skipped, not pass", () => {
+  const { status, summary } = classifyDeltas(
+    [makeDelta({ status: "unchanged", key: "k1" })],
+    3,
+  );
+  assert.equal(status, "skipped");
+  assert.equal(summary.missingCandidate, 3);
+});
+
+test("regressions with missing candidate still skips (no partial resolves)", () => {
+  const { status } = classifyDeltas(
+    [makeDelta({ status: "regression", key: "k1" })],
+    2,
+  );
+  assert.equal(status, "skipped");
 });

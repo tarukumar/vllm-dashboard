@@ -1,16 +1,20 @@
 -- Eval regression alert episodes.
 --
--- Each row tracks one regression episode for a (model, task, metric, filter)
--- combination.  An episode opens when a nightly result regresses beyond the
--- sigma threshold relative to the baseline, and resolves when a later check
--- shows the metric has recovered.
+-- Each row tracks one regression episode for a (model, task, n_shot, metric,
+-- filter) combination — matching the evalKey in compare.ts.  An episode opens
+-- when a nightly result regresses beyond the sigma threshold relative to the
+-- baseline, and resolves when a later check positively shows recovery.
+-- Missing data (no candidate rows, partial failures) never opens or resolves
+-- an episode.
 
-CREATE TABLE IF NOT EXISTS eval_regression_alerts (
+CREATE TABLE IF NOT EXISTS alerting_eval_regression_alerts (
     alert_id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     model               text NOT NULL,
     task                text NOT NULL,
+    n_shot              integer NOT NULL,
     metric              text NOT NULL,
     filter              text NOT NULL,
+    higher_is_better    boolean NOT NULL DEFAULT true,
     status              text NOT NULL CHECK (status IN ('open', 'resolved')),
     baseline_image      text NOT NULL,
     baseline_value      double precision NOT NULL,
@@ -22,56 +26,74 @@ CREATE TABLE IF NOT EXISTS eval_regression_alerts (
     opened_at           timestamptz NOT NULL DEFAULT now(),
     resolved_at         timestamptz,
     created_at          timestamptz NOT NULL DEFAULT now(),
-    updated_at          timestamptz NOT NULL DEFAULT now()
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CHECK (
+        (status = 'open' AND resolved_at IS NULL)
+        OR
+        (status = 'resolved' AND resolved_at IS NOT NULL)
+    )
 );
 
--- Only one open alert per (model, task, metric, filter).
-CREATE UNIQUE INDEX IF NOT EXISTS eval_regression_alerts_open_idx
-    ON eval_regression_alerts (model, task, metric, filter)
+-- Only one open alert per (model, task, n_shot, metric, filter).
+CREATE UNIQUE INDEX IF NOT EXISTS alerting_eval_regression_alerts_open_idx
+    ON alerting_eval_regression_alerts (model, task, n_shot, metric, filter)
     WHERE status = 'open';
 
-CREATE INDEX IF NOT EXISTS eval_regression_alerts_history_idx
-    ON eval_regression_alerts (
+CREATE INDEX IF NOT EXISTS alerting_eval_regression_alerts_history_idx
+    ON alerting_eval_regression_alerts (
         status, COALESCE(resolved_at, opened_at) DESC
     );
 
 -- Snapshot of each cron comparison run for history and debugging.
-CREATE TABLE IF NOT EXISTS eval_regression_snapshots (
+-- status includes 'skipped' for runs where data was absent, so the banner
+-- can distinguish "healthy" from "cron stopped running".
+CREATE TABLE IF NOT EXISTS alerting_eval_regression_snapshots (
     snapshot_id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     baseline_image      text NOT NULL,
     candidate_image     text NOT NULL,
-    status              text NOT NULL CHECK (status IN ('pass', 'regression')),
+    status              text NOT NULL CHECK (status IN ('pass', 'regression', 'skipped')),
     summary             jsonb NOT NULL,
-    regressions         jsonb NOT NULL DEFAULT '[]'::jsonb,
     compare_url         text,
-    slack_message_ts    text,
     checked_at          timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS eval_regression_snapshots_checked_idx
-    ON eval_regression_snapshots (checked_at DESC);
+CREATE INDEX IF NOT EXISTS alerting_eval_regression_snapshots_checked_idx
+    ON alerting_eval_regression_snapshots (checked_at DESC);
 
 -- Daily Slack message tracking (one consolidated message per Pacific day,
 -- updated in place like queue alerts).
-CREATE TABLE IF NOT EXISTS eval_alert_summary (
+CREATE TABLE IF NOT EXISTS alerting_eval_alert_summary (
     id              text PRIMARY KEY,
     message_ts      text NOT NULL,
+    status          text,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
--- Row-level security: prevent Supabase public API roles from accessing these
--- tables directly.
-ALTER TABLE public.eval_regression_alerts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.eval_regression_snapshots ENABLE ROW LEVEL SECURITY;
+-- Widen the notification outbox path check to include eval.
+ALTER TABLE alerting_notification_outbox
+    DROP CONSTRAINT IF EXISTS alerting_notification_outbox_path_check;
+ALTER TABLE alerting_notification_outbox
+    ADD CONSTRAINT alerting_notification_outbox_path_check
+    CHECK (alert_path IN ('fast_ci', 'full_ci', 'main_ci', 'infra', 'eval'));
+
+-- Row-level security.
+ALTER TABLE public.alerting_eval_regression_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alerting_eval_regression_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.alerting_eval_alert_summary ENABLE ROW LEVEL SECURITY;
 
 DO $$
 DECLARE
     api_role name;
     protected_tables constant text :=
-        'public.eval_regression_alerts, '
-        'public.eval_regression_snapshots, '
-        'public.eval_alert_summary';
+        'public.alerting_eval_regression_alerts, '
+        'public.alerting_eval_regression_snapshots, '
+        'public.alerting_eval_alert_summary';
+    seq_names constant text[] := ARRAY[
+        'public.alerting_eval_regression_alerts_alert_id_seq',
+        'public.alerting_eval_regression_snapshots_snapshot_id_seq'
+    ];
+    seq_name text;
 BEGIN
     FOREACH api_role IN ARRAY ARRAY['anon'::name, 'authenticated'::name]
     LOOP
@@ -81,6 +103,14 @@ BEGIN
                 protected_tables,
                 api_role
             );
+            FOREACH seq_name IN ARRAY seq_names
+            LOOP
+                EXECUTE format(
+                    'REVOKE ALL PRIVILEGES ON SEQUENCE %s FROM %I',
+                    seq_name,
+                    api_role
+                );
+            END LOOP;
         END IF;
     END LOOP;
 END;
