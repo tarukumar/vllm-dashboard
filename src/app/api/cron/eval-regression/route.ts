@@ -242,7 +242,11 @@ export async function GET(request: NextRequest) {
 
     // Slack notification — compare against last notified state, not day-row.
     const channel = slackChannel();
-    if (channel && process.env.SLACK_BOT_TOKEN) {
+    if (!channel || !process.env.SLACK_BOT_TOKEN) {
+      console.warn(
+        "Eval regression: Slack not configured (missing SLACK_EVAL_ALERT_CHANNEL/SLACK_BOT_TOKEN) — notifications disabled",
+      );
+    } else {
       const time = fmtPacificTime();
       const tz = getPacificTzAbbr();
       const dateKey = getPacificDateKey();
@@ -349,6 +353,7 @@ export async function GET(request: NextRequest) {
     console.error("Eval regression check failed:", error);
     try {
       const db = getDb();
+      await touchHeartbeat(db);
       await db`
         INSERT INTO alerting_eval_regression_snapshots
           (status, summary, checked_at)
