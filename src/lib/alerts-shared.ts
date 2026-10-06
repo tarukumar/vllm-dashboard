@@ -172,3 +172,13 @@ export function fmtMetricDelta(d: number, unit: string): string {
 export function fmtSigma(s: number | null): string {
   return s !== null ? `${s.toFixed(1)}σ` : "";
 }
+
+/** CSS classes for a regression delta, coloured by whether the change is beneficial. */
+export function evalDeltaColor(
+  delta: number,
+  higherIsBetter: boolean,
+): string {
+  const beneficial = higherIsBetter ? delta : -delta;
+  if (beneficial < 0) return "font-medium text-red-600 dark:text-red-400";
+  return "font-medium text-emerald-600 dark:text-emerald-400";
+}

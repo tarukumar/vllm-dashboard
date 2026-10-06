@@ -3,6 +3,7 @@ import {
   formatRelativeTime,
   fmtMetricValue,
   fmtMetricDelta,
+  evalDeltaColor,
 } from "@/lib/alerts-shared";
 import { inferUnit } from "@/lib/compare";
 import type {
@@ -55,12 +56,6 @@ function CheckStatusBadge({
   }
 }
 
-function deltaColor(alert: EvalRegressionAlert): string {
-  const beneficial = alert.higher_is_better ? alert.delta : -alert.delta;
-  if (beneficial < 0) return "font-medium text-red-600 dark:text-red-400";
-  return "font-medium text-emerald-600 dark:text-emerald-400";
-}
-
 function AlertRow({ alert }: { alert: EvalRegressionAlert }) {
   const unit = alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value);
   return (
@@ -79,7 +74,7 @@ function AlertRow({ alert }: { alert: EvalRegressionAlert }) {
           <span className="font-mono">{alert.model}</span>
           <span>
             {fmtMetricValue(alert.baseline_value, unit)} → {fmtMetricValue(alert.candidate_value, unit)}{" "}
-            <span className={deltaColor(alert)}>
+            <span className={evalDeltaColor(alert.delta, alert.higher_is_better)}>
               ({fmtMetricDelta(alert.delta, unit)}
               {alert.significance !== null &&
                 `, ${alert.significance.toFixed(1)}σ`}

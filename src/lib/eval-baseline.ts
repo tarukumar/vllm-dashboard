@@ -129,14 +129,6 @@ export function resolveLatestNightlyImageFromRows(
 }
 
 /**
- * Convenience wrappers that load rows on demand (used by the baseline API
- * endpoint, not by the cron path).
- */
-export async function resolveLatestNightlyImage(): Promise<string | null> {
-  return resolveLatestNightlyImageFromRows(await loadEvalRows());
-}
-
-/**
  * Resolve the eval baseline.
  *
  * @param image     Explicit baseline image.  When omitted, the latest

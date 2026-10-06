@@ -109,7 +109,7 @@ It prints a formatted table to the Buildkite log and exits:
 
 ## Tables
 
-All tables use the `alerting_` prefix (migration `0023`).
+All tables use the `alerting_` prefix (migration `0030`).
 
 - `alerting_eval_regression_alerts` — one row per open or resolved alert
   episode.  Unique constraint on `(model, task, n_shot, metric, filter)

@@ -211,7 +211,7 @@ def test_main_ci_agent_updates_are_append_only_revision_scoped_sidecars() -> Non
 
 
 def test_eval_regression_schema_preserves_one_open_episode_per_eval_key() -> None:
-    sql = (MIGRATIONS_DIR / "0023_eval_regression_alerts.sql").read_text()
+    sql = (MIGRATIONS_DIR / "0030_eval_regression_alerts.sql").read_text()
 
     assert "CREATE TABLE IF NOT EXISTS alerting_eval_regression_alerts" in sql
     assert "CREATE TABLE IF NOT EXISTS alerting_eval_regression_snapshots" in sql

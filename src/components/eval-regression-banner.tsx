@@ -3,6 +3,7 @@ import {
   formatRelativeTime,
   fmtMetricValue,
   fmtMetricDelta,
+  evalDeltaColor,
 } from "@/lib/alerts-shared";
 import { inferUnit } from "@/lib/compare";
 import type {
@@ -31,11 +32,6 @@ function isStale(checkedAt: string | null | undefined): boolean {
   return age > STALE_THRESHOLD_MS;
 }
 
-function deltaColor(alert: EvalRegressionAlert): string {
-  const beneficial = alert.higher_is_better ? alert.delta : -alert.delta;
-  if (beneficial < 0) return "font-medium text-red-600 dark:text-red-400";
-  return "font-medium text-emerald-600 dark:text-emerald-400";
-}
 
 export function EvalRegressionBanner() {
   const { data } = useSWR<EvalAlertsResponse>(
@@ -148,7 +144,7 @@ export function EvalRegressionBanner() {
                 {alert.metric}:{" "}
                 {fmtMetricValue(alert.baseline_value, unit(alert))} →{" "}
                 {fmtMetricValue(alert.candidate_value, unit(alert))}{" "}
-                <span className={deltaColor(alert)}>
+                <span className={evalDeltaColor(alert.delta, alert.higher_is_better)}>
                   ({fmtMetricDelta(alert.delta, unit(alert))}
                   {alert.significance !== null &&
                     `, ${alert.significance.toFixed(1)}σ`}

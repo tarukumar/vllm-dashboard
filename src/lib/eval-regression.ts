@@ -16,18 +16,11 @@ import {
 } from "@/lib/eval-baseline";
 import { describeImage } from "@/lib/commit-from-image";
 
+import type { EvalRegressionSummary } from "./eval-alert-types";
+
 export type RegressionStatus = "pass" | "regression" | "skipped";
 
-export interface RegressionSummary {
-  total: number;
-  passed: number;
-  regressed: number;
-  improved: number;
-  noisy: number;
-  unchanged: number;
-  missingBaseline: number;
-  missingCandidate: number;
-}
+export type RegressionSummary = EvalRegressionSummary;
 
 export interface RegressionResult {
   status: RegressionStatus;
@@ -92,8 +85,13 @@ function buildCompareUrl(
   dashboardUrl: string,
   baseline: string,
   candidate: string,
+  evalSigma: number,
 ): string {
-  const params = new URLSearchParams({ baseline, candidate });
+  const params = new URLSearchParams({
+    baseline,
+    candidate,
+    eval_sigma: String(evalSigma),
+  });
   return `${dashboardUrl}/compare?${params.toString()}`;
 }
 
@@ -178,6 +176,7 @@ export async function runRegressionCheck(
       dashboardUrl,
       baseline.baselineImage,
       candidateImage,
+      evalSigma,
     ),
   };
 }
