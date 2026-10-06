@@ -70,6 +70,7 @@ def test_expected_tables_are_created() -> None:
         "alerting_eval_regression_alerts",
         "alerting_eval_regression_snapshots",
         "alerting_eval_alert_summary",
+        "alerting_eval_last_notified",
     }
 
     for table in expected_tables:
@@ -222,14 +223,16 @@ def test_eval_regression_schema_preserves_one_open_episode_per_eval_key() -> Non
     assert "status = 'resolved' AND resolved_at IS NOT NULL" in sql
     assert "ON alerting_eval_regression_alerts (model, task, n_shot, metric, filter)" in sql
     assert "WHERE status = 'open'" in sql
-    assert "status IN ('pass', 'regression', 'skipped')" in sql
-    assert "'fast_ci', 'full_ci', 'main_ci', 'infra', 'eval'" in sql
+    assert "status IN ('pass', 'regression', 'skipped', 'error')" in sql
+    assert "unit                text NOT NULL" in sql
+    assert "CREATE TABLE IF NOT EXISTS alerting_eval_last_notified" in sql
     assert "alerting_eval_regression_alerts_alert_id_seq" in sql
     assert "alerting_eval_regression_snapshots_snapshot_id_seq" in sql
     for table in (
         "alerting_eval_regression_alerts",
         "alerting_eval_regression_snapshots",
         "alerting_eval_alert_summary",
+        "alerting_eval_last_notified",
     ):
         assert f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY" in sql
 

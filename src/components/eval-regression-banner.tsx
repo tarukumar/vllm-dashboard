@@ -4,6 +4,7 @@ import {
   fmtMetricValue,
   fmtMetricDelta,
 } from "@/lib/alerts-shared";
+import { inferUnit } from "@/lib/compare";
 import type {
   EvalRegressionAlert,
   EvalRegressionSnapshot,
@@ -24,12 +25,6 @@ const STALE_THRESHOLD_MS = 13 * 60 * 60 * 1000;
 function isStale(checkedAt: string): boolean {
   const age = Date.now() - new Date(checkedAt).getTime();
   return age > STALE_THRESHOLD_MS;
-}
-
-function inferUnit(baseline: number, candidate: number): string {
-  return baseline >= 0 && baseline <= 1 && candidate >= 0 && candidate <= 1
-    ? "score"
-    : "raw";
 }
 
 function deltaColor(alert: EvalRegressionAlert): string {
@@ -107,7 +102,7 @@ export function EvalRegressionBanner() {
             {latestSnapshot.baseline_image} vs {latestSnapshot.candidate_image}
             {" · "}
             checked {formatRelativeTime(latestSnapshot.checked_at)}
-            {!isSkipped && ` · ${s.total} metrics, ${s.regressed} regressed, ${s.improved} improved`}
+            {!isSkipped && !isError && ` · ${s.total} metrics, ${s.regressed} regressed, ${s.improved} improved`}
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -142,10 +137,10 @@ export function EvalRegressionBanner() {
                 {alert.task}
               </span>
               <span className="text-zinc-500 dark:text-zinc-400">
-                {alert.metric}:                 {fmtMetricValue(alert.baseline_value, inferUnit(alert.baseline_value, alert.candidate_value))} →{" "}
-                {fmtMetricValue(alert.candidate_value, inferUnit(alert.baseline_value, alert.candidate_value))}{" "}
+                {alert.metric}:                 {fmtMetricValue(alert.baseline_value, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))} →{" "}
+                {fmtMetricValue(alert.candidate_value, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))}{" "}
                 <span className={deltaColor(alert)}>
-                  ({fmtMetricDelta(alert.delta, inferUnit(alert.baseline_value, alert.candidate_value))}
+                  ({fmtMetricDelta(alert.delta, alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value))}
                   {alert.significance !== null &&
                     `, ${alert.significance.toFixed(1)}σ`}
                   )

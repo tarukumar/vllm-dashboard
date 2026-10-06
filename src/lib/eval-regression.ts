@@ -2,8 +2,9 @@
  * Regression detection for eval accuracy benchmarks (lm_eval + BFCL).
  *
  * Compares the latest nightly eval results against a dynamic baseline
- * (latest release image).  Missing data (no candidate rows, total === 0)
- * is treated as no evidence — it never opens or resolves an episode.
+ * (latest release image).  When total === 0 (no metrics compared) the run
+ * is skipped.  Coverage gaps (missingCandidate > 0) are normal and do not
+ * suppress evidence — per-key resolution is handled by planEpisodes().
  */
 
 import { loadEvalRows } from "@/lib/eval-data";

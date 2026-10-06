@@ -4,6 +4,7 @@ import {
   fmtMetricValue,
   fmtMetricDelta,
 } from "@/lib/alerts-shared";
+import { inferUnit } from "@/lib/compare";
 import type {
   EvalRegressionAlert,
   EvalRegressionSnapshot,
@@ -21,33 +22,37 @@ function StatusBadge({ status }: { status: "open" | "resolved" }) {
   );
 }
 
-function CheckStatusBadge({ status }: { status: string }) {
-  if (status === "pass") {
-    return (
-      <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
-        Pass
-      </span>
-    );
+function CheckStatusBadge({
+  status,
+}: {
+  status: EvalRegressionSnapshot["status"];
+}) {
+  switch (status) {
+    case "pass":
+      return (
+        <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+          Pass
+        </span>
+      );
+    case "skipped":
+      return (
+        <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+          Skipped
+        </span>
+      );
+    case "error":
+      return (
+        <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+          Error
+        </span>
+      );
+    case "regression":
+      return (
+        <span className="shrink-0 rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700 dark:bg-red-950/60 dark:text-red-300">
+          Regression
+        </span>
+      );
   }
-  if (status === "skipped") {
-    return (
-      <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
-        Skipped
-      </span>
-    );
-  }
-  if (status === "error") {
-    return (
-      <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
-        Error
-      </span>
-    );
-  }
-  return (
-    <span className="shrink-0 rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700 dark:bg-red-950/60 dark:text-red-300">
-      Regression
-    </span>
-  );
 }
 
 function deltaColor(alert: EvalRegressionAlert): string {
@@ -56,14 +61,8 @@ function deltaColor(alert: EvalRegressionAlert): string {
   return "font-medium text-emerald-600 dark:text-emerald-400";
 }
 
-function inferUnit(baseline: number, candidate: number): string {
-  return baseline >= 0 && baseline <= 1 && candidate >= 0 && candidate <= 1
-    ? "score"
-    : "raw";
-}
-
 function AlertRow({ alert }: { alert: EvalRegressionAlert }) {
-  const unit = inferUnit(alert.baseline_value, alert.candidate_value);
+  const unit = alert.unit ?? inferUnit(alert.baseline_value, alert.candidate_value);
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-sm sm:px-5">
       <div className="min-w-0 flex-1">

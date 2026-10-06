@@ -10,19 +10,31 @@ latest **nightly** image (candidate) and the latest **release** image
 The baseline is dynamic — resolved from Databricks by picking the newest
 release image that has eval data (`classifyImage` → `groupImagesByKind`).
 
-When no candidate data exists (`total === 0` or `missingCandidate > 0`),
-the run is recorded as **skipped**: no alerts are opened, resolved, or
-notified.  This prevents false all-clear messages.
+### Evidence rules
+
+- `total === 0` (no metrics compared at all) → **skipped**: no alerts
+  opened, resolved, or notified.
+- Coverage gaps (`missingCandidate > 0`) are normal — nightlies run a
+  subset of the baseline matrix.  They are reported in the summary but do
+  not suppress evidence.  Resolve decisions are **per-key**: only keys
+  this run actually compared can resolve; uncovered keys stay open.
+- Errors (Databricks unreachable, no release image) → **error** snapshot
+  recorded with zeroed summary.  No alerts opened or resolved.
 
 ## Where the code lives
 
 - `src/lib/eval-regression.ts` — core logic.  `classifyDeltas()` is a
   pure function (tested); `runRegressionCheck()` orchestrates a single
   Databricks load, baseline resolution, comparison, and threshold check.
+- `src/lib/eval-episodes.ts` — pure `planEpisodes()` decides which alerts
+  to open, resolve, or leave alone.  `shouldNotify()` compares current
+  state against the last notification to prevent daily all-clear spam and
+  detect same-day escalation (new regressions, partial recovery).
 - `src/lib/eval-baseline.ts` — dynamic baseline resolution.  All functions
   accept a pre-loaded row set so the cron path avoids redundant scans.
 - `src/app/api/cron/eval-regression/route.ts` — cron endpoint: auth →
-  regression check → persist snapshot → upsert/resolve alerts in a
+  regression check → short-circuit if same (baseline, candidate) as last
+  snapshot → persist snapshot → plan episodes → upsert/resolve in a
   transaction → Slack notification on state change.
 - `src/app/api/eval/baseline/route.ts` — `GET /api/eval/baseline` returns
   the resolved baseline image and metadata (no full metrics payload).
@@ -31,8 +43,10 @@ notified.  This prevents false all-clear messages.
 - `src/components/eval-alerts.tsx` — alert list with open/resolved
   sections and recent-checks history.
 - `src/components/eval-regression-banner.tsx` — status banner on the Eval
-  page showing pass/regression/skipped/stale states.
+  page showing pass/regression/skipped/error/stale states.
 - `src/lib/eval-regression.test.ts` — unit tests for `classifyDeltas`.
+- `src/lib/eval-episodes.test.ts` — unit tests for `planEpisodes` and
+  `shouldNotify`.
 - Schedule: Vercel cron in `vercel.json` hits `/api/cron/eval-regression`
   every 6 hours (`0 */6 * * *`).
 
@@ -50,18 +64,33 @@ a thresholds table.
 
 ## What it posts to Slack
 
-One combined message per Pacific day (keyed by `alerting_eval_alert_summary.id`).
-On each run with a state change the route either posts the day's message or
-edits it in place, then adds a thread reply so the channel gets a
-notification.
+Notification is driven by `shouldNotify()`, which compares against the
+**last notified state** (stored in `alerting_eval_last_notified`, not the
+day-row), so:
+
+- A healthy system produces no daily all-clear (unlike a day-row diff
+  that would fire on every new Pacific day).
+- Same-day escalation (new regressions, partial recovery, different model)
+  triggers an update because the regression key set changed.
+- An unchanged regression is not re-pinged.
+
+When notifying, the route either creates a new Slack message or edits the
+current day's message in place (keyed by `alerting_eval_alert_summary.id`),
+then adds a thread reply for the channel notification.
 
 - **Regression**: `:rotating_light:` header listing up to 15 regressed
-  metrics with baseline → candidate values, delta, and sigma.
-- **Pass**: `:white_check_mark:` header with total metrics checked.
-- **Resolved**: When a regression clears, a ✅ reaction is added to the
-  day message.
+  metrics with baseline → candidate values, delta, and sigma.  Coverage
+  gaps are noted ("N baseline metrics not covered by this nightly").
+- **Pass**: `:white_check_mark:` header with total metrics checked, plus
+  a ✅ reaction on the day message.
+- **Error/skipped**: no Slack activity.
 
-Skipped runs produce no Slack activity.
+## Duplicate-pair short-circuit
+
+When the `(baseline, candidate)` pair matches the last non-error snapshot,
+the cron run returns early without writing a new snapshot, running episode
+logic, or posting to Slack.  This avoids redundant work when eval data
+changes at most daily but the cron fires every 6h.
 
 ## Integration with perf-eval (Buildkite)
 
@@ -79,15 +108,22 @@ All tables use the `alerting_` prefix (migration `0023`).
 
 - `alerting_eval_regression_alerts` — one row per open or resolved alert
   episode.  Unique constraint on `(model, task, n_shot, metric, filter)
-  WHERE status = 'open'` ensures one open episode per eval key.
+  WHERE status = 'open'` ensures one open episode per eval key.  Stores
+  `unit` so old episodes keep the formatting they were reported with.
 - `alerting_eval_regression_snapshots` — one row per cron run (including
-  skipped).  Retained for 30 days (see retention cron).
+  skipped and error).  `error` snapshots carry a zeroed summary with an
+  `error` field.  Retained for 30 days (see retention cron).
 - `alerting_eval_alert_summary` — one row per Pacific day: Slack message
-  ts and latest status.  Used for edit-in-place and reaction logic.
+  ts, status, and `regression_keys` (for escalation detection within the
+  same day message).
+- `alerting_eval_last_notified` — single row carrying notification state
+  across Pacific days (status + regression key set).  Prevents spurious
+  daily all-clear messages.
 
 ## Dashboard views
 
 - `/alerts` → "Eval regressions" tab shows open/resolved alerts and recent
   check history.
 - `/eval` → `<EvalRegressionBanner />` shows current pass/regression/
-  skipped/stale status with a staleness threshold of 7 hours.
+  skipped/error/stale status.  Staleness threshold: 13 hours (two cron
+  cadences plus margin).

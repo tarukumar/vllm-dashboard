@@ -172,8 +172,13 @@ function perfDimension(row: PerfRun): string {
 }
 
 /** True when both values look like 0-1 normalized scores (accuracy, F1, etc.). */
-function isNormalized(a: number, b: number): boolean {
+export function isNormalized(a: number, b: number): boolean {
   return a >= 0 && a <= 1 && b >= 0 && b <= 1;
+}
+
+/** Infer display unit from metric values. */
+export function inferUnit(baseline: number, candidate: number): string {
+  return isNormalized(baseline, candidate) ? "score" : "raw";
 }
 
 function evalKey(row: EvalRow, metric: EvalMetric): string {
@@ -186,15 +191,34 @@ function evalKey(row: EvalRow, metric: EvalMetric): string {
   ].join("|");
 }
 
-/** Inverse of evalKey — recovers structured fields from a |-joined key. */
-export function parseEvalKey(delta: { key: string; model: string; metric: string }) {
+export interface ParsedEvalKey {
+  model: string;
+  task: string;
+  nShot: number;
+  metric: string;
+  filter: string;
+}
+
+/**
+ * Inverse of evalKey — recovers structured fields from a |-joined key.
+ * Returns null when the key is malformed (fewer than 5 parts, missing task,
+ * or unparseable n_shot) so callers can skip rather than invent an identity.
+ */
+export function parseEvalKey(
+  delta: { key: string; model: string; metric: string },
+): ParsedEvalKey | null {
   const parts = delta.key.split("|");
+  if (parts.length < 5) return null;
+  const task = parts[1];
+  const nShot = parseInt(parts[2], 10);
+  const filter = parts[4];
+  if (!task || Number.isNaN(nShot) || filter === undefined) return null;
   return {
     model: delta.model,
-    task: parts[1] ?? "",
-    nShot: parseInt(parts[2] ?? "0", 10),
+    task,
+    nShot,
     metric: delta.metric,
-    filter: parts[4] ?? "",
+    filter,
   };
 }
 

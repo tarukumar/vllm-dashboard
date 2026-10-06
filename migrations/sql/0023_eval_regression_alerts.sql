@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS alerting_eval_regression_alerts (
     metric              text NOT NULL,
     filter              text NOT NULL,
     higher_is_better    boolean NOT NULL DEFAULT true,
+    unit                text NOT NULL DEFAULT 'score',
     status              text NOT NULL CHECK (status IN ('open', 'resolved')),
     baseline_image      text NOT NULL,
     baseline_value      double precision NOT NULL,
@@ -66,9 +67,21 @@ CREATE TABLE IF NOT EXISTS alerting_eval_alert_summary (
     id              text PRIMARY KEY,
     message_ts      text NOT NULL,
     status          text,
+    regression_keys jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
+
+-- Carries the last notification state across Pacific days so a new day
+-- does not fire a spurious all-clear.  Single row, upserted on notify.
+CREATE TABLE IF NOT EXISTS alerting_eval_last_notified (
+    id              integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    status          text NOT NULL,
+    regression_keys jsonb NOT NULL DEFAULT '[]'::jsonb,
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.alerting_eval_last_notified ENABLE ROW LEVEL SECURITY;
 
 -- Row-level security.
 ALTER TABLE public.alerting_eval_regression_alerts ENABLE ROW LEVEL SECURITY;
@@ -81,7 +94,8 @@ DECLARE
     protected_tables constant text :=
         'public.alerting_eval_regression_alerts, '
         'public.alerting_eval_regression_snapshots, '
-        'public.alerting_eval_alert_summary';
+        'public.alerting_eval_alert_summary, '
+        'public.alerting_eval_last_notified';
     seq_names constant text[] := ARRAY[
         'public.alerting_eval_regression_alerts_alert_id_seq',
         'public.alerting_eval_regression_snapshots_snapshot_id_seq'
