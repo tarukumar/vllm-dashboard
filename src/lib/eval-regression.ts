@@ -46,9 +46,11 @@ export interface RegressionResult {
 /**
  * Pure classification over a list of deltas.  Exported for testing.
  *
- * Returns "skipped" when there is no evidence (total === 0 or missing
- * candidate data dominates).  This prevents empty runs from resolving
- * open episodes or posting all-clear messages.
+ * Returns "skipped" only when `total === 0` (no metrics compared at all).
+ * Coverage gaps (missingCandidate > 0) are normal — nightlies run a subset
+ * of the baseline matrix — and are reported but do not suppress evidence.
+ * The cron route resolves alerts only for keys actually compared (per-key
+ * evidence), so uncovered keys stay open rather than falsely resolving.
  */
 export function classifyDeltas(
   deltas: DeltaItem[],
@@ -60,10 +62,9 @@ export function classifyDeltas(
   const unchanged = deltas.filter((d) => d.status === "unchanged");
 
   const total = deltas.length;
-  const hasEvidence = total > 0 && missingCandidate === 0;
 
   let status: RegressionStatus;
-  if (!hasEvidence) {
+  if (total === 0) {
     status = "skipped";
   } else if (regressions.length > 0) {
     status = "regression";

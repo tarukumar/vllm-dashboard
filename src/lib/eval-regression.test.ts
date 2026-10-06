@@ -86,19 +86,22 @@ test("empty deltas classify as skipped", () => {
   assert.equal(summary.regressed, 0);
 });
 
-test("missing candidate data classifies as skipped, not pass", () => {
+test("missing candidate data does not suppress evidence (coverage gaps are normal)", () => {
   const { status, summary } = classifyDeltas(
     [makeDelta({ status: "unchanged", key: "k1" })],
     3,
   );
-  assert.equal(status, "skipped");
+  assert.equal(status, "pass");
   assert.equal(summary.missingCandidate, 3);
+  assert.equal(summary.total, 1);
 });
 
-test("regressions with missing candidate still skips (no partial resolves)", () => {
-  const { status } = classifyDeltas(
+test("regressions surface even with missing candidate (per-key evidence)", () => {
+  const { status, summary } = classifyDeltas(
     [makeDelta({ status: "regression", key: "k1" })],
     2,
   );
-  assert.equal(status, "skipped");
+  assert.equal(status, "regression");
+  assert.equal(summary.regressed, 1);
+  assert.equal(summary.missingCandidate, 2);
 });

@@ -18,11 +18,18 @@ interface EvalAlertsResponse {
   schemaStatus?: string;
 }
 
-const STALE_THRESHOLD_MS = 7 * 60 * 60 * 1000;
+// Two cron cadences (6h each) plus margin. One late run won't flash amber.
+const STALE_THRESHOLD_MS = 13 * 60 * 60 * 1000;
 
 function isStale(checkedAt: string): boolean {
   const age = Date.now() - new Date(checkedAt).getTime();
   return age > STALE_THRESHOLD_MS;
+}
+
+function inferUnit(baseline: number, candidate: number): string {
+  return baseline >= 0 && baseline <= 1 && candidate >= 0 && candidate <= 1
+    ? "score"
+    : "raw";
 }
 
 function deltaColor(alert: EvalRegressionAlert): string {
@@ -48,9 +55,10 @@ export function EvalRegressionBanner() {
   const stale = isStale(latestSnapshot.checked_at);
   const isPass = latestSnapshot.status === "pass";
   const isSkipped = latestSnapshot.status === "skipped";
+  const isError = latestSnapshot.status === "error";
   const s = latestSnapshot.summary;
 
-  const borderClass = stale
+  const borderClass = stale || isError
     ? "border-amber-200/80 bg-amber-50/50 dark:border-amber-900/50 dark:bg-amber-950/20"
     : isPass
       ? "border-emerald-200/80 bg-emerald-50/50 dark:border-emerald-900/50 dark:bg-emerald-950/20"
@@ -58,7 +66,7 @@ export function EvalRegressionBanner() {
         ? "border-zinc-200/80 bg-zinc-50/50 dark:border-zinc-800/50 dark:bg-zinc-950/20"
         : "border-red-200/80 bg-red-50/50 dark:border-red-900/50 dark:bg-red-950/20";
 
-  const headingClass = stale
+  const headingClass = stale || isError
     ? "text-amber-800 dark:text-amber-200"
     : isPass
       ? "text-emerald-800 dark:text-emerald-200"
@@ -71,6 +79,9 @@ export function EvalRegressionBanner() {
   if (stale) {
     icon = "⚠️";
     heading = "Eval regression check is stale";
+  } else if (isError) {
+    icon = "⚠️";
+    heading = "Eval regression check failed";
   } else if (isSkipped) {
     icon = "⏭️";
     heading = "Eval check skipped — no candidate data";
@@ -131,10 +142,10 @@ export function EvalRegressionBanner() {
                 {alert.task}
               </span>
               <span className="text-zinc-500 dark:text-zinc-400">
-                {alert.metric}: {fmtMetricValue(alert.baseline_value, "score")} →{" "}
-                {fmtMetricValue(alert.candidate_value, "score")}{" "}
+                {alert.metric}:                 {fmtMetricValue(alert.baseline_value, inferUnit(alert.baseline_value, alert.candidate_value))} →{" "}
+                {fmtMetricValue(alert.candidate_value, inferUnit(alert.baseline_value, alert.candidate_value))}{" "}
                 <span className={deltaColor(alert)}>
-                  ({fmtMetricDelta(alert.delta, "score")}
+                  ({fmtMetricDelta(alert.delta, inferUnit(alert.baseline_value, alert.candidate_value))}
                   {alert.significance !== null &&
                     `, ${alert.significance.toFixed(1)}σ`}
                   )

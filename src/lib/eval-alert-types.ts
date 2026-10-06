@@ -24,7 +24,7 @@ export interface EvalRegressionSnapshot {
   snapshot_id: number;
   baseline_image: string;
   candidate_image: string;
-  status: "pass" | "regression" | "skipped";
+  status: "pass" | "regression" | "skipped" | "error";
   summary: {
     total: number;
     passed: number;

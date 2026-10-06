@@ -21,7 +21,7 @@ function StatusBadge({ status }: { status: "open" | "resolved" }) {
   );
 }
 
-function CheckStatusBadge({ status }: { status: "pass" | "regression" | "skipped" }) {
+function CheckStatusBadge({ status }: { status: string }) {
   if (status === "pass") {
     return (
       <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
@@ -33,6 +33,13 @@ function CheckStatusBadge({ status }: { status: "pass" | "regression" | "skipped
     return (
       <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
         Skipped
+      </span>
+    );
+  }
+  if (status === "error") {
+    return (
+      <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+        Error
       </span>
     );
   }
@@ -49,8 +56,14 @@ function deltaColor(alert: EvalRegressionAlert): string {
   return "font-medium text-emerald-600 dark:text-emerald-400";
 }
 
+function inferUnit(baseline: number, candidate: number): string {
+  return baseline >= 0 && baseline <= 1 && candidate >= 0 && candidate <= 1
+    ? "score"
+    : "raw";
+}
+
 function AlertRow({ alert }: { alert: EvalRegressionAlert }) {
-  const unit = "score";
+  const unit = inferUnit(alert.baseline_value, alert.candidate_value);
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-sm sm:px-5">
       <div className="min-w-0 flex-1">
@@ -91,9 +104,11 @@ function SnapshotRow({ snapshot }: { snapshot: EvalRegressionSnapshot }) {
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm sm:px-5">
       <CheckStatusBadge status={snapshot.status} />
       <span className="text-xs text-zinc-500 dark:text-zinc-400">
-        {snapshot.status === "skipped"
-          ? "No candidate data"
-          : `${s.total} metrics · ${s.regressed} regressed · ${s.improved} improved`}
+        {snapshot.status === "error"
+          ? "Check failed"
+          : snapshot.status === "skipped"
+            ? "No candidate data"
+            : `${s.total} metrics · ${s.regressed} regressed · ${s.improved} improved`}
       </span>
       <span className="ml-auto shrink-0 font-mono text-xs text-zinc-400">
         {formatRelativeTime(snapshot.checked_at)}

@@ -160,12 +160,14 @@ export function getPacificDateKey(): string {
 
 export function fmtMetricValue(v: number, unit: string): string {
   if (unit === "score") return `${(v * 100).toFixed(2)}%`;
+  if (unit === "raw") return v.toFixed(4);
   return v.toFixed(4);
 }
 
 export function fmtMetricDelta(d: number, unit: string): string {
   const sign = d >= 0 ? "+" : "";
   if (unit === "score") return `${sign}${(d * 100).toFixed(2)}pp`;
+  if (unit === "raw") return `${sign}${d.toFixed(4)}`;
   return `${sign}${d.toFixed(4)}`;
 }
 

@@ -49,9 +49,9 @@ CREATE INDEX IF NOT EXISTS alerting_eval_regression_alerts_history_idx
 -- can distinguish "healthy" from "cron stopped running".
 CREATE TABLE IF NOT EXISTS alerting_eval_regression_snapshots (
     snapshot_id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    baseline_image      text NOT NULL,
-    candidate_image     text NOT NULL,
-    status              text NOT NULL CHECK (status IN ('pass', 'regression', 'skipped')),
+    baseline_image      text NOT NULL DEFAULT 'unknown',
+    candidate_image     text NOT NULL DEFAULT 'unknown',
+    status              text NOT NULL CHECK (status IN ('pass', 'regression', 'skipped', 'error')),
     summary             jsonb NOT NULL,
     compare_url         text,
     checked_at          timestamptz NOT NULL DEFAULT now()
@@ -69,13 +69,6 @@ CREATE TABLE IF NOT EXISTS alerting_eval_alert_summary (
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
-
--- Widen the notification outbox path check to include eval.
-ALTER TABLE alerting_notification_outbox
-    DROP CONSTRAINT IF EXISTS alerting_notification_outbox_path_check;
-ALTER TABLE alerting_notification_outbox
-    ADD CONSTRAINT alerting_notification_outbox_path_check
-    CHECK (alert_path IN ('fast_ci', 'full_ci', 'main_ci', 'infra', 'eval'));
 
 -- Row-level security.
 ALTER TABLE public.alerting_eval_regression_alerts ENABLE ROW LEVEL SECURITY;

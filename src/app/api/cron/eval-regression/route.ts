@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/db";
 import { runRegressionCheck, type RegressionResult } from "@/lib/eval-regression";
+import { parseEvalKey } from "@/lib/compare";
 import { postMessage, updateMessage, addReaction } from "@/lib/slack";
 import {
   fmtMetricDelta,
@@ -12,21 +13,6 @@ import {
 } from "@/lib/alerts-shared";
 
 export const maxDuration = 55;
-
-/**
- * Parse structured fields from a DeltaItem.key.
- * evalKey in compare.ts joins: model|task|n_shot|metric.name|metric.filter
- */
-function parseEvalKey(delta: { key: string; model: string; metric: string }) {
-  const parts = delta.key.split("|");
-  return {
-    model: delta.model,
-    task: parts[1] ?? "",
-    nShot: parseInt(parts[2] ?? "0", 10),
-    metric: delta.metric,
-    filter: parts[4] ?? "",
-  };
-}
 
 function evalAlertKey(fields: { model: string; task: string; nShot: number; metric: string; filter: string }) {
   return `${fields.model}|${fields.task}|${fields.nShot}|${fields.metric}|${fields.filter}`;
@@ -121,36 +107,56 @@ export async function GET(request: NextRequest) {
     }
 
     // Upsert regression alerts inside a transaction.
-    await db.begin(async (tx) => {
-      if (result.status === "regression") {
-        for (const reg of result.regressions) {
+    // postgres.js' TransactionSql type omits call signatures even though the
+    // runtime transaction object is the same callable tagged-template API.
+    await db.begin(async (transaction) => {
+      const tx = transaction as unknown as typeof db;
+      if (result.status === "regression" && result.regressions.length > 0) {
+        const rows = result.regressions.map((reg) => {
           const f = parseEvalKey(reg);
-          await tx`
-            INSERT INTO alerting_eval_regression_alerts
-              (model, task, n_shot, metric, filter, higher_is_better, status,
-               baseline_image, baseline_value, candidate_image, candidate_value,
-               delta, delta_pct, significance)
-            VALUES (
-              ${f.model}, ${f.task}, ${f.nShot}, ${f.metric}, ${f.filter},
-              ${reg.higherIsBetter},
-              'open',
-              ${result.baselineImage}, ${reg.baselineValue},
-              ${result.candidateImage}, ${reg.candidateValue},
-              ${reg.delta}, ${reg.deltaPct}, ${reg.significance}
-            )
-            ON CONFLICT (model, task, n_shot, metric, filter) WHERE status = 'open'
-            DO UPDATE SET
-              candidate_image = EXCLUDED.candidate_image,
-              candidate_value = EXCLUDED.candidate_value,
-              delta = EXCLUDED.delta,
-              delta_pct = EXCLUDED.delta_pct,
-              significance = EXCLUDED.significance,
-              updated_at = now()
-          `;
-        }
+          return {
+            model: f.model,
+            task: f.task,
+            n_shot: f.nShot,
+            metric: f.metric,
+            filter: f.filter,
+            higher_is_better: reg.higherIsBetter,
+            status: "open",
+            baseline_image: result.baselineImage,
+            baseline_value: reg.baselineValue,
+            candidate_image: result.candidateImage,
+            candidate_value: reg.candidateValue,
+            delta: reg.delta,
+            delta_pct: reg.deltaPct,
+            significance: reg.significance,
+          };
+        });
+        await tx`
+          INSERT INTO alerting_eval_regression_alerts ${tx(
+            rows,
+            "model", "task", "n_shot", "metric", "filter",
+            "higher_is_better", "status",
+            "baseline_image", "baseline_value",
+            "candidate_image", "candidate_value",
+            "delta", "delta_pct", "significance",
+          )}
+          ON CONFLICT (model, task, n_shot, metric, filter) WHERE status = 'open'
+          DO UPDATE SET
+            candidate_image = EXCLUDED.candidate_image,
+            candidate_value = EXCLUDED.candidate_value,
+            delta = EXCLUDED.delta,
+            delta_pct = EXCLUDED.delta_pct,
+            significance = EXCLUDED.significance,
+            updated_at = now()
+        `;
       }
 
-      // Resolve alerts that positively passed (not missing).
+      // Resolve alerts only for keys this run actually compared.
+      // Keys not covered by the nightly (coverage gaps) stay open — no
+      // false resolves from missing data.
+      const comparedKeys = new Set(
+        result.allDeltas.map((d) => evalAlertKey(parseEvalKey(d))),
+      );
       const regressionKeys = new Set(
         result.regressions.map((r) => evalAlertKey(parseEvalKey(r))),
       );
@@ -164,7 +170,7 @@ export async function GET(request: NextRequest) {
       const toResolve = openAlerts
         .filter((a) => {
           const key = `${a.model}|${a.task}|${a.n_shot}|${a.metric}|${a.filter}`;
-          return !regressionKeys.has(key);
+          return comparedKeys.has(key) && !regressionKeys.has(key);
         })
         .map((a) => a.alert_id);
 
@@ -196,7 +202,7 @@ export async function GET(request: NextRequest) {
 
       const changed = prevStatus !== result.status;
 
-      if (changed || result.status === "regression") {
+      if (changed) {
         const text = buildSlackText(result, time, tz);
         let messageTs = prevMessageTs;
 
@@ -252,6 +258,22 @@ export async function GET(request: NextRequest) {
     });
   } catch (error) {
     console.error("Eval regression check failed:", error);
+    // Record the failure so the banner can distinguish "Databricks
+    // unreachable" from "cron stopped running".
+    try {
+      const db = getDb();
+      await db`
+        INSERT INTO alerting_eval_regression_snapshots
+          (baseline_image, candidate_image, status, summary, checked_at)
+        VALUES (
+          'unknown', 'unknown', 'error',
+          ${JSON.stringify({ error: String(error) })}::jsonb,
+          now()
+        )
+      `;
+    } catch (snapshotError) {
+      console.error("Failed to record error snapshot:", snapshotError);
+    }
     return NextResponse.json(
       { error: "Eval regression check failed" },
       { status: 500 },

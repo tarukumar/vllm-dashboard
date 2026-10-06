@@ -171,6 +171,11 @@ function perfDimension(row: PerfRun): string {
   return `${row.device} - TP ${row.tp} - conc ${row.conc} - ISL ${row.isl} - OSL ${row.osl} - ${row.precision}`;
 }
 
+/** True when both values look like 0-1 normalized scores (accuracy, F1, etc.). */
+function isNormalized(a: number, b: number): boolean {
+  return a >= 0 && a <= 1 && b >= 0 && b <= 1;
+}
+
 function evalKey(row: EvalRow, metric: EvalMetric): string {
   return [
     row.model,
@@ -179,6 +184,18 @@ function evalKey(row: EvalRow, metric: EvalMetric): string {
     metric.name,
     metric.filter,
   ].join("|");
+}
+
+/** Inverse of evalKey — recovers structured fields from a |-joined key. */
+export function parseEvalKey(delta: { key: string; model: string; metric: string }) {
+  const parts = delta.key.split("|");
+  return {
+    model: delta.model,
+    task: parts[1] ?? "",
+    nShot: parseInt(parts[2] ?? "0", 10),
+    metric: delta.metric,
+    filter: parts[4] ?? "",
+  };
 }
 
 function evalDimension(row: EvalRow, metric: EvalMetric): string {
@@ -480,7 +497,7 @@ export function compareEvalRows(
       dimension: evalDimension(baselineRun.row, baselineRun.metric),
       metric: baselineRun.metric.name,
       metricLabel: `${baselineRun.metric.name} (${baselineRun.metric.filter})`,
-      unit: "score",
+      unit: isNormalized(baselineRun.metric.value, candidateRun.metric.value) ? "score" : "raw",
       higherIsBetter: baselineRun.metric.higher_is_better,
       baselineValue: baselineRun.metric.value,
       candidateValue: candidateRun.metric.value,
