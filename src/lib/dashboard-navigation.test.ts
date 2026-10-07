@@ -5,7 +5,7 @@ import {
   TOP_LEVEL_NAV_ITEMS,
 } from "./dashboard-navigation";
 
-test("CI Health owns builds, jobs, queue, tests, parity, and alerts routes", () => {
+test("CI Health owns builds, jobs, queue, tests, parity, alerts, and force-merges routes", () => {
   for (const pathname of [
     "/",
     "/jobs",
@@ -13,6 +13,7 @@ test("CI Health owns builds, jobs, queue, tests, parity, and alerts routes", () 
     "/tests",
     "/parity",
     "/alerts",
+    "/force-merges",
   ]) {
     assert.equal(sectionForPathname(pathname)?.label, "CI Health");
   }
@@ -24,6 +25,7 @@ test("CI Health owns builds, jobs, queue, tests, parity, and alerts routes", () 
     "/tests",
     "/parity",
     "/alerts",
+    "/force-merges",
   ]);
 });
 

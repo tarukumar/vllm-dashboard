@@ -15,7 +15,7 @@ export const DASHBOARD_SECTIONS = [
     href: "/",
     label: "CI Health",
     description:
-      "Build outcomes, job runs, queue health, test reliability, AMD parity, and alert history.",
+      "Build outcomes, job runs, queue health, test reliability, AMD parity, alert history, and force-merges.",
     links: [
       { href: "/", label: "Builds" },
       { href: "/jobs", label: "Jobs" },
@@ -23,6 +23,7 @@ export const DASHBOARD_SECTIONS = [
       { href: "/tests", label: "Tests" },
       { href: "/parity", label: "Parity" },
       { href: "/alerts", label: "Alerts" },
+      { href: "/force-merges", label: "Force-merges" },
     ],
   },
   {
