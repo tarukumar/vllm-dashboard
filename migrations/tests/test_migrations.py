@@ -71,10 +71,24 @@ def test_expected_tables_are_created() -> None:
         "alerting_eval_regression_snapshots",
         "alerting_eval_alert_summary",
         "alerting_eval_last_notified",
+        "force_merge_records",
     }
 
     for table in expected_tables:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
+
+
+def test_force_merge_records_are_keyed_by_pr_and_cover_author_ranking() -> None:
+    sql = (MIGRATIONS_DIR / "0028_force_merge_stats.sql").read_text()
+
+    assert "CREATE TABLE IF NOT EXISTS force_merge_records" in sql
+    assert "pr_number     integer PRIMARY KEY" in sql
+    assert "ci_state      text" in sql
+    assert "force_merged  boolean NOT NULL" in sql
+    assert "idx_force_merge_records_merged" in sql
+    assert (
+        "ON force_merge_records (author, merged_at DESC) WHERE force_merged" in sql
+    )
 
 
 def test_fast_ci_schema_keys_events_by_job_and_links_notification_batches() -> None:

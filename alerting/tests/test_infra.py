@@ -432,14 +432,73 @@ def test_shared_nfs_volume_pages_once_regardless_of_mounting_host_count() -> Non
     assert slack.updates[0]["payload"]["text"].endswith("~")
 
 
-def test_other_role_and_errored_mounts_never_alert() -> None:
+def test_local_disks_with_the_same_device_name_page_per_host() -> None:
+    # Live failure: every mithril host's root is ext4 /dev/vda1. Grouped by
+    # (fstype, device) they shared one episode, so a second host filling up
+    # while the first was still open never paged.
     snapshots = FixtureSnapshots()
     snapshots.threshold_rows.append(
         threshold(InfraAlertType.DISK_USAGE, 90, "percent")
     )
     snapshots.disks = [
-        mount("h200-ci-1", "/dev/sdb1", fstype="ext4", role="other",
-              used_percent=99.0, mount_point="/scratch"),
+        mount("mithril-h200-1", "/dev/vda1", fstype="ext4", role="system",
+              mount_point="/"),
+        mount("mithril-h200-2", "/dev/vda1", fstype="ext4", role="system",
+              used_percent=40.0, mount_point="/"),
+    ]
+    runtime, store, outbox, _, clock = runtime_for(FixtureHosts(), snapshots)
+
+    scan(runtime, clock.now())
+    clock.advance(minutes=5)
+    scan(runtime, clock.now())
+    assert [episode.subject_key for episode in store.episodes()] == [
+        "disk:mithril-h200-1:ext4:/dev/vda1"
+    ]
+
+    # The second host filling opens its own episode while the first is open.
+    snapshots.disks[1] = mount("mithril-h200-2", "/dev/vda1", fstype="ext4",
+                               role="system", mount_point="/")
+    clock.advance(minutes=5)
+    scan(runtime, clock.now())
+    clock.advance(minutes=5)
+    scan(runtime, clock.now())
+    assert sorted(
+        (episode.subject_key, episode.status) for episode in store.episodes()
+    ) == [
+        ("disk:mithril-h200-1:ext4:/dev/vda1", "open"),
+        ("disk:mithril-h200-2:ext4:/dev/vda1", "open"),
+    ]
+    assert outbox.count() == 2
+
+
+def test_other_role_mounts_alert() -> None:
+    # Live failure: /mnt/local on the mithril hosts was missing from the
+    # reporter's role map, so it reported as 'other' and filled silently.
+    snapshots = FixtureSnapshots()
+    snapshots.threshold_rows.append(
+        threshold(InfraAlertType.DISK_USAGE, 90, "percent")
+    )
+    snapshots.disks = [
+        mount("mithril-h200-1", "/dev/vdc", fstype="ext4", role="other",
+              used_percent=99.0, mount_point="/mnt/local"),
+    ]
+    runtime, store, _, _, clock = runtime_for(FixtureHosts(), snapshots)
+
+    scan(runtime, clock.now())
+    clock.advance(minutes=5)
+    scan(runtime, clock.now())
+
+    assert [episode.subject_key for episode in store.episodes()] == [
+        "disk:mithril-h200-1:ext4:/dev/vdc"
+    ]
+
+
+def test_errored_mounts_never_alert() -> None:
+    snapshots = FixtureSnapshots()
+    snapshots.threshold_rows.append(
+        threshold(InfraAlertType.DISK_USAGE, 90, "percent")
+    )
+    snapshots.disks = [
         mount("h200-ci-1", "nfs01:/exports/ci", used_percent=99.0,
               error="i/o error"),
     ]
