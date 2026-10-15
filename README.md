@@ -2,6 +2,9 @@
 
 A Next.js dashboard for observing vLLM's Buildkite CI: build status, job runtimes, queue depth, agent capacity, infrastructure cost, and performance benchmark trends.
 
+## FYI
+This repository is 100% vibe-coded and this README is not meant for human to read. Please save your time and just use agents.
+
 ## Agent access
 
 Point agents to **[ci.vllm.ai/agents.md](https://ci.vllm.ai/agents.md)** for the
