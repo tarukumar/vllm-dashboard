@@ -36,15 +36,24 @@ an episode. Episodes can also be closed by hand from the dashboard
   `KIMI_MAIN_CI_REASONING_EFFORT` (default `max`), independent of the
   shared `KIMI_*` settings.
 - Control plane: S3 `control/main_ci.mode` (`shadow` default / `live` /
-  `disabled`) governs all three timers together. Main CI currently posts
-  nothing to Slack, so the mode only enables or disables the timers.
+  `disabled`) governs all three timers together. It also sets whether the
+  image-build posts below are delivered (`live`) or only recorded
+  (`shadow`).
 - Dashboard writes use separate credentials: `ALERT_OPERATOR_TOKEN` for human
   resolution and `ALERT_AGENT_TOKEN` for append-only responder updates.
 
 ## What it posts to Slack
 
-Nothing. Lifecycle records deliberately carry raw Buildkite evidence only;
-diagnosis stays a curated Slack concern. The dashboard is the consumer.
+Only image-build breakage. When `image-build`, `image-build-cpu` or
+`arm64-image-build` (`IMAGE_BUILD_STEPS` in `alerting/main_ci.py`) is red
+on two main builds with no pass between, the poller or the backstop
+enqueues one post under an "Image build failing on main" header block, and
+one "green again" post when the episode resolves. A retry inside one build
+counts as one red build, so a single blip stays dashboard-only. Posts go to
+the shared alert channel (`SLACK_CI_ALERT_CHANNEL`, default `C0ANHBE642Y`),
+told apart from the other paths by its header. Every other episode stays dashboard-only:
+lifecycle records carry raw Buildkite evidence, and diagnosis stays a curated
+Slack concern.
 
 ## Dashboard history
 
