@@ -115,6 +115,16 @@ class FakePostgresConnection:
             return Result(rows=list(self.state["recent_hosts"]))
         if statement.startswith("WITH RECURSIVE latest AS ("):
             return Result(rows=list(self.state["mounts"]))
+        if statement.startswith(
+            (
+                "SELECT DISTINCT ON (hostname, gpu_index) hostname, gpu_index, "
+                "recovery_action",
+                "SELECT DISTINCT ON (hostname) hostname, gpu_query_hung",
+                "SELECT hostname, bus_id, xid, at FROM gpu_xid_events",
+                "SELECT DISTINCT hostname, queue FROM buildkite_agent_snapshots",
+            )
+        ):
+            return Result(rows=[])  # trigger-rule readings: none reported
         if statement.startswith("SELECT DISTINCT ON (hostname, gpu_index)"):
             return Result(rows=list(self.state["temps"]))
         if statement.startswith("SELECT hostname, count(DISTINCT gpu_index)"):
@@ -378,3 +388,24 @@ def test_postgres_stage_change_merges_its_patch_and_keeps_dashboard_fields() -> 
     }
     [row] = connection.state["outbox"].values()
     assert str(row[0]).endswith(":resolved")
+
+
+def test_xid_query_reads_only_the_trigger_rule_xids() -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    class XidConnection(FakePostgresConnection):
+        def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Result:
+            seen.append(params)
+            return Result(rows=[("gpu-node-7", "", 79, START)])
+
+    store = PostgresAlertStore(lambda: XidConnection())
+    events = store.xid_events(hostnames=["gpu-node-7"], since=START)
+
+    assert [event.xid for event in events] == [79]
+    [(hosts, since, xids)] = seen
+    assert (hosts, since) == (["gpu-node-7"], START)
+    # First sight, B200 NVLink first sight, and repeat Xids (design §4.2).
+    assert xids == [
+        46, 48, 54, 62, 64, 74, 79, 95, 109, 110, 119, 120, 136, 140, 143,
+        144, 145, 146, 147, 148, 149, 150, 157, 158, 171, 172,
+    ]
