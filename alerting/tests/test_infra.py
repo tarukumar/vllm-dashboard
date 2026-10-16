@@ -6,6 +6,7 @@ import json
 import pathlib
 import subprocess
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -949,7 +950,10 @@ def test_every_alert_type_is_permitted_by_the_sql_constraints(constraint: str) -
 
 
 def quarantine_runtime(
-    decisions: list[QuarantineDecision], *, live: bool = False
+    decisions: list[QuarantineDecision],
+    *,
+    live: bool = False,
+    operator_destination: str | None = None,
 ) -> tuple[AlertingRuntime, InMemoryInfraStore, RecordingSlackPort, FixedClock]:
     clock = FixedClock(START)
     executions = InMemoryAutomationExecutionStore()
@@ -958,6 +962,8 @@ def quarantine_runtime(
     store = InMemoryInfraStore(executions=executions, outbox=outbox)
     snapshots = FixtureSnapshots()
     snapshots.threshold_rows = []
+    # A pool of eight: the safety limits allow two out at once.
+    snapshots.agents = [(f"gpu-node-{n}", "h200_35gb") for n in range(1, 9)]
     runtime = AlertingRuntime(
         executions=executions,
         outbox=outbox,
@@ -971,6 +977,7 @@ def quarantine_runtime(
                 clock=clock,
                 quarantine_decisions=lambda: list(decisions),
                 quarantine_live=live,
+                operator_destination=operator_destination,
             )
         },
         alert_path=None,
@@ -978,11 +985,27 @@ def quarantine_runtime(
     return runtime, store, slack, clock
 
 
+def test_a_tripped_breaker_also_reaches_the_operator() -> None:
+    # Hardware faults skip the pool cap, so the breaker is what stops four.
+    decisions = [
+        replace(quarantine_decision(f"gpu-node-{n}"), hardware=True)
+        for n in range(1, 5)
+    ]
+    runtime, store, slack, clock = quarantine_runtime(
+        decisions, live=True, operator_destination="UOPS"
+    )
+    scan_and_post(runtime, clock)
+    channel, operator = slack.deliveries
+    assert operator.destination == "UOPS"
+    assert operator.payload == channel.payload
+    assert "detector suspect" in operator.payload["text"]
+
+
 def quarantine_decision(host: str = "GPU-Node-7") -> QuarantineDecision:
     return QuarantineDecision(
         host=host,
-        cluster="b200",
-        pool="b200",
+        cluster="h200",
+        pool="h200_35gb",
         reason="Xid 79: GPU fell off the bus",
         evidence={"xid": 79, "gpu": 3},
     )
@@ -1002,7 +1025,7 @@ def test_live_quarantine_runs_the_whole_sequence_on_actuator_reports() -> None:
     [episode] = store.open_episodes()
     assert episode.subject_key == "gpu-node-7"
     assert episode.details["stage"] == "quarantining"
-    assert episode.details["cluster"] == "b200"
+    assert episode.details["cluster"] == "h200"
     assert episode.details["evidence"] == {"xid": 79, "gpu": 3}
     assert "commanded_at" in episode.details
     assert slack.deliveries[-1].payload["text"].endswith(
@@ -1191,7 +1214,7 @@ def test_actuator_not_confirming_posts_once_per_stage() -> None:
 
 
 def job_failure_runtime(
-    fetch: Any,
+    fetch: Any, *, live: bool = False
 ) -> tuple[AlertingRuntime, InMemoryInfraStore, RecordingSlackPort, FixedClock]:
     clock = FixedClock(START)
     executions = InMemoryAutomationExecutionStore()
@@ -1212,6 +1235,7 @@ def job_failure_runtime(
                 store=store,
                 clock=clock,
                 job_failure_decisions=fetch,
+                quarantine_live=live,
             )
         },
         alert_path=None,
@@ -1237,6 +1261,19 @@ def test_job_failure_trigger_runs_every_15_minutes_and_its_decisions_hold() -> N
     assert len(slack.deliveries) == 1
     cached = {state.subject_key for state in store.infra_state().states}
     assert "trigger:job_failure" in cached
+
+
+def test_job_failure_decisions_stay_dry_run_when_quarantine_is_live() -> None:
+    # Fetched and then cached: neither path takes a host out.
+    runtime, store, slack, clock = job_failure_runtime(
+        lambda now: [quarantine_decision()], live=True
+    )
+    for _ in range(3):
+        scan_and_post(runtime, clock)
+    [episode] = store.open_episodes()
+    assert episode.details["stage"] == "would"
+    assert len(slack.deliveries) == 1
+    assert "would quarantine" in slack.deliveries[0].payload["text"]
 
 
 def test_a_failed_job_failure_fetch_yields_nothing_and_retries_next_scan(
@@ -1280,8 +1317,12 @@ def test_a_trigger_rule_opens_a_dry_run_quarantine_with_its_pool() -> None:
         "b200",
         "b200-k8s",
     )
+    # The pool's only known host: a hardware fault would page a person.
     text = slack.deliveries[-1].payload["text"]
-    assert text.endswith("would quarantine `dgxb200-test`: Xid 79 on GPU unknown")
+    assert text.endswith(
+        "would quarantine `dgxb200-test`: Xid 79 on GPU unknown "
+        "(last serving host: would page a person)"
+    )
 
 
 def test_a_gpu_fault_reading_opens_a_dry_run_quarantine() -> None:
@@ -1297,7 +1338,11 @@ def test_a_gpu_fault_reading_opens_a_dry_run_quarantine() -> None:
     [episode] = store.open_episodes()
     assert episode.subject_key == "dgxb200-test"
     text = slack.deliveries[-1].payload["text"]
-    assert text.endswith("the driver asks for recovery (Reset) on GPU 2")
+    # The pool's only known host: a hardware fault would page a person.
+    assert text.endswith(
+        "the driver asks for recovery (Reset) on GPU 2 "
+        "(last serving host: would page a person)"
+    )
 
 
 def test_a_host_fault_reading_opens_a_dry_run_quarantine_on_its_second_check() -> None:
@@ -1314,4 +1359,8 @@ def test_a_host_fault_reading_opens_a_dry_run_quarantine_on_its_second_check() -
     [episode] = store.open_episodes()
     assert episode.subject_key == "dgxb200-test"
     text = slack.deliveries[-1].payload["text"]
-    assert text.endswith("the GPU query hung on 2 consecutive checks")
+    # The pool's only known host: a host fault would be held.
+    assert text.endswith(
+        "the GPU query hung on 2 consecutive checks "
+        "(would be held: last serving host in its pool)"
+    )
