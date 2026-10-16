@@ -106,9 +106,17 @@ export const MAX_MATCH = 200;
 
 /**
  * Resolves a host's open quarantine episode (alert type 'quarantine' in
- * alerting_infra_alerts) by moving its stage to 'resolving'. The episode stays
- * open: the actuator undoes its cordon and taint or lock file, and the worker
- * marks it resolved once the host is back. A dry-run ('would') episode has
+ * alerting_infra_alerts) by moving its stage to 'resolve_requested'. The
+ * episode stays open: the worker waits for a fresh reading taken after the
+ * request and sends it back to quarantined if a trigger still fires, else
+ * moves it to 'resolving'. `force` skips that wait and goes straight to
+ * 'resolving', as does a held episode: its host never went out, and its
+ * trigger is usually still firing, so the wait would take it out past the
+ * limit that held it. A resolve already waiting can only be forced, for when
+ * the reading never comes (a dead reporter). The actuator then runs its return check, undoes its cordon and
+ * taint or lock file, and the worker marks it resolved once the host is back. It
+ * clears the last actuator report and return-check failure, so a check that
+ * failed before doesn't send this resolve straight back to quarantined. A dry-run ('would') episode has
  * nothing to undo, so it is a 409, as is one already resolving or resolved;
  * a host never quarantined is a 404.
  */
@@ -117,20 +125,32 @@ export async function resolveQuarantine(
   host: string,
   by: string,
   reason: string,
+  force = false,
 ): Promise<ActionResult> {
   const resolved = await db<{ alert_id: string }[]>`
     UPDATE alerting_infra_alerts
     SET details = details || jsonb_build_object(
-          'stage', 'resolving',
+          'stage', CASE
+            WHEN ${force}::boolean OR details->>'stage' = 'held' THEN 'resolving'
+            ELSE 'resolve_requested'
+          END,
+          'resolve_forced', ${force}::boolean,
           'resolved_by', ${by}::text,
           'resolve_reason', ${reason}::text,
-          'resolve_requested_at', now()
+          'resolve_requested_at', now(),
+          'resolving_at', NULL::text,
+          'actuator_state', NULL::text,
+          'verify_note', NULL::text,
+          'verify_check', NULL::text
         ),
         updated_at = now()
     WHERE alert_type = 'quarantine'
       AND subject_key = ${host}
       AND status = 'open'
-      AND details->>'stage' IN ('held', 'quarantining', 'quarantined')
+      AND (
+        details->>'stage' IN ('held', 'quarantining', 'quarantined')
+        OR (${force}::boolean AND details->>'stage' = 'resolve_requested')
+      )
     RETURNING alert_id
   `;
   if (resolved.length > 0) {
@@ -148,6 +168,12 @@ export async function resolveQuarantine(
   if (stage === "would") {
     return fail(409, "This is a dry-run quarantine; nothing was applied to resolve.");
   }
+  if (stage === "resolve_requested") {
+    return fail(
+      409,
+      "This resolve is already waiting for a clean reading; skip the check to return it now.",
+    );
+  }
   if (stage === "resolving") {
     return fail(409, "This quarantine is already being resolved.");
   }
@@ -155,7 +181,13 @@ export async function resolveQuarantine(
 }
 
 /** Episode stages an actuator acts on; it only logs 'would'. */
-const ACTUATED_STAGES = ["would", "quarantining", "quarantined", "resolving"];
+const ACTUATED_STAGES = [
+  "would",
+  "quarantining",
+  "quarantined",
+  "resolve_requested",
+  "resolving",
+];
 
 /**
  * The hosts one cluster's actuator should have out (quarantining,
@@ -166,10 +198,17 @@ export async function desiredQuarantines(
   cluster: string,
 ): Promise<ActionResult> {
   const rows = await db<
-    { host: string; alert_id: string; stage: string; reason: string | null }[]
+    {
+      host: string;
+      alert_id: string;
+      stage: string;
+      reason: string | null;
+      actuator_state: string | null;
+    }[]
   >`
     SELECT subject_key AS host, alert_id, details->>'stage' AS stage,
-           details->>'reason' AS reason
+           details->>'reason' AS reason,
+           details->>'actuator_state' AS actuator_state
     FROM alerting_infra_alerts
     WHERE alert_type = 'quarantine'
       AND status = 'open'
@@ -185,12 +224,21 @@ export async function desiredQuarantines(
         alertId: Number(row.alert_id),
         stage: row.stage,
         reason: row.reason,
+        // Its own last report: after 'verify_failed' it starts no new
+        // return check until a person resolves again.
+        actuatorState: row.actuator_state,
       })),
     },
   };
 }
 
-export const ACTUATOR_STATES = ["out", "drained", "returned"] as const;
+export const ACTUATOR_STATES = [
+  "out",
+  "drained",
+  "verifying",
+  "verify_failed",
+  "returned",
+] as const;
 export type ActuatorState = (typeof ACTUATOR_STATES)[number];
 
 /**

@@ -31,6 +31,7 @@ export type ResolveQuarantine = (
   host: string,
   by: string,
   reason: string,
+  force: boolean,
 ) => Promise<void>;
 
 const INPUT =
@@ -39,13 +40,17 @@ const INPUT =
 function ResolveQuarantineForm({
   host,
   onResolve,
+  forceOnly,
 }: {
   host: string;
   onResolve: ResolveQuarantine;
+  /** The resolve already waits for a clean reading; only skipping it is left. */
+  forceOnly: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [by, setBy] = useState("");
   const [reason, setReason] = useState("");
+  const [force, setForce] = useState(forceOnly);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -56,7 +61,7 @@ function ResolveQuarantineForm({
         onClick={() => setOpen(true)}
         className="dashboard-control h-6 shrink-0 rounded-md border border-zinc-200 px-2 text-[11px] font-medium text-zinc-500 hover:border-zinc-300 hover:text-zinc-900 dark:border-zinc-800 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:text-zinc-100"
       >
-        Resolve
+        {forceOnly ? "Skip the wait" : "Resolve"}
       </button>
     );
   }
@@ -68,7 +73,7 @@ function ResolveQuarantineForm({
         setPending(true);
         setError(null);
         try {
-          await onResolve(host, by.trim(), reason.trim());
+          await onResolve(host, by.trim(), reason.trim(), force);
         } catch (failure) {
           setError(failure instanceof Error ? failure.message : "Resolve failed.");
           setPending(false);
@@ -93,6 +98,17 @@ function ResolveQuarantineForm({
         required
         className={INPUT}
       />
+      {/* By default the host waits for a fresh reading that no longer shows
+          the fault; skip it only when you know better than the reading. */}
+      <label className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+        <input
+          type="checkbox"
+          checked={force}
+          disabled={forceOnly}
+          onChange={(event) => setForce(event.target.checked)}
+        />
+        Skip the clean-reading check
+      </label>
       <button
         type="submit"
         disabled={pending}
@@ -143,8 +159,11 @@ function EpisodeRow({
       </p>
       {onResolveQuarantine && isResolvableQuarantine(episode) && (
         <ResolveQuarantineForm
+          // A resolve that moves the episode on starts the form afresh.
+          key={String(episode.details.stage)}
           host={episode.subjectKey}
           onResolve={onResolveQuarantine}
+          forceOnly={episode.details.stage === "resolve_requested"}
         />
       )}
     </li>

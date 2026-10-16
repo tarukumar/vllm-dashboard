@@ -5,7 +5,9 @@ Quarantine actuator for K8s clusters: makes the cluster match the dashboard.
 Runs on the control plane every minute. Pulls the desired quarantine set for
 this cluster from the dashboard and reconciles each node:
 
-  quarantining / quarantined
+  quarantining / quarantined / resolve_requested
+      (resolve_requested: a person resolved it and the dashboard is waiting
+      for a clean reading before it says resolving; the node stays out.)
       Cordon + taint vllm.ci/quarantine=<reason>:NoSchedule (both). The
       cordon and its ownership annotation vllm.ci/quarantine-cordoned=true
       go in one patch guarded by the node's resourceVersion.
@@ -14,6 +16,14 @@ this cluster from the dashboard and reconciles each node:
       Pending. A quarantined node that lost the cordon or our taint (by hand)
       gets both back and the post carries reapplied: true.
   resolving
+      First the return check, on a node we took out. While CI pods are
+      still on the node it posts "out" with a note naming their jobs. Then
+      a one-off pod holding
+      every GPU on the node checks nvidia-smi's recovery action and row
+      remapping, then runs `dcgmi diag -r QUARANTINE_VERIFY_LEVEL`. While it
+      runs the post is "verifying"; if it fails, or doesn't finish within
+      VERIFY_TIMEOUT, it is "verify_failed", the node stays out, and the
+      dashboard moves the episode back to quarantined. Once it passes:
       Removes our taint. Uncordons only if we cordoned, that is when the
       annotation is present, lifting the cordon and the annotation in one
       guarded patch. A cordon
@@ -36,12 +46,17 @@ Environment variables:
                          used, to reach /api/alerts/quarantine/... (required)
   GPU_REPORT_SECRET    - Bearer token for auth, shared with the reporter
   QUARANTINE_CLUSTER   - This cluster's name in the desired set (required)
+  QUARANTINE_VERIFY_LEVEL - dcgmi diag run level for the return check
+                         (default 2; 0 skips the check)
+  QUARANTINE_VERIFY_IMAGE - DCGM image for the return check; match the
+                         cluster's DCGM version
 
 --dry-run changes nothing: kubectl writes and dashboard posts are logged.
 """
 
 import argparse
 import concurrent.futures
+import datetime
 import json
 import os
 import re
@@ -57,17 +72,40 @@ CLUSTER = os.environ.get("QUARANTINE_CLUSTER", "")
 TAINT_KEY = "vllm.ci/quarantine"
 CORDON_MARK = "vllm.ci/quarantine-cordoned"  # annotation: the cordon is ours
 CI_NAMESPACE = "buildkite"
-OUT_STAGES = ("quarantining", "quarantined")
+OUT_STAGES = ("quarantining", "quarantined", "resolve_requested")
 KUBECTL_TIMEOUT = 20
 # Nodes reconcile in parallel so slow calls on some (a hung pod list, a
 # dashboard POST timing out) can't use up the run before later nodes get
 # their turn. Each node's own steps stay in order on one worker.
 NODE_WORKERS = 8
 
+GPU_RESOURCE = "nvidia.com/gpu"
+VERIFY_LEVEL = os.environ.get("QUARANTINE_VERIFY_LEVEL", "2")
+VERIFY_IMAGE = os.environ.get(
+    "QUARANTINE_VERIFY_IMAGE", "nvcr.io/nvidia/cloud-native/dcgm:4.4.2-1-ubuntu22.04")
+# Its own namespace, so the actuator can create pods nowhere that holds
+# another service account worth taking (quarantine-actuator-k8s-rbac.yaml).
+VERIFY_NS = "vllm-quarantine-verify"
+# Measured from the pod's creation, so it covers the image pull and the
+# check itself.
+VERIFY_TIMEOUT = datetime.timedelta(minutes=30)
+# $1 is the diag level. A recovery action or row-remap value of [N/A] is
+# unsupported on the GPU, not a fault.
+VERIFY_SCRIPT = r"""
+set -o pipefail
+nvidia-smi --query-gpu=index,gpu_recovery_action,remapped_rows.failure \
+    --format=csv,noheader \
+  | awk -F', *' '{ print } ($2 != "None" && $2 !~ /^\[/) || $3 == "Yes" { bad = 1 }
+                 END { exit bad }' \
+  || { echo "a GPU needs recovery or is out of spare memory rows"; exit 1; }
+nv-hostengine && sleep 3 || exit 1
+dcgmi diag -r "$1" | tee /tmp/diag && ! grep -qi fail /tmp/diag
+"""
 
-def kubectl(*args):
+
+def kubectl(*args, input=None):
     result = subprocess.run(
-        ["kubectl", *args], capture_output=True, text=True,
+        ["kubectl", *args], capture_output=True, text=True, input=input,
         timeout=KUBECTL_TIMEOUT,
     )
     if result.returncode != 0:
@@ -107,13 +145,53 @@ def our_taint(node):
     return None
 
 
-def ci_pod_count(name):
+def ci_pods(name):
+    """CI pods still Running or Pending on the node."""
     pods = json.loads(kubectl(
         "get", "pods", "-n", CI_NAMESPACE,
         "--field-selector", f"spec.nodeName={name}", "-o", "json",
     ))["items"]
-    return sum(p["status"].get("phase") in ("Running", "Pending")
-               for p in pods)
+    return [p for p in pods
+            if p["status"].get("phase") in ("Running", "Pending")]
+
+
+def ci_wait_note(pods):
+    """Names the jobs a return check waits on, by Buildkite URL."""
+    jobs = [(p["metadata"].get("annotations") or {}).get(
+                "buildkite.com/job-url") or p["metadata"]["name"]
+            for p in pods]
+    return (f"waiting for {len(pods)} CI job(s) to finish: "
+            + ", ".join(jobs[:3]) + (", ..." if len(jobs) > 3 else ""))
+
+
+def verify_pod_name(node_name):
+    return f"vllm-quarantine-verify-{node_name}"
+
+
+def verify_pod(node):
+    """The return-check pod: pinned to the node, holding all its GPUs."""
+    name = node["metadata"]["name"]
+    gpus = node["status"]["allocatable"][GPU_RESOURCE]
+    return {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": verify_pod_name(name), "namespace": VERIFY_NS,
+                     "labels": {"app": "vllm-quarantine-verify"}},
+        "spec": {
+            # nodeName skips the scheduler, so our cordon and taint don't
+            # keep it off; the toleration covers the kubelet's own checks.
+            "nodeName": name, "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "runtimeClassName": "nvidia",
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [{
+                "name": "verify", "image": VERIFY_IMAGE,
+                "command": ["bash", "-c", VERIFY_SCRIPT, "verify",
+                            VERIFY_LEVEL],
+                "securityContext": {"capabilities": {"add": ["SYS_ADMIN"]}},
+                "resources": {"limits": {GPU_RESOURCE: gpus}},
+            }],
+        },
+    }
 
 
 class Actuator:
@@ -121,25 +199,28 @@ class Actuator:
         self.dry_run = dry_run
         self.ok = True
 
-    def write(self, *args):
+    def write(self, *args, input=None):
         if self.dry_run:
             print(f"  DRY RUN: kubectl {' '.join(args)}")
         else:
-            kubectl(*args)
+            kubectl(*args, input=input)
 
     def post(self, host, alert_id, state, observed):
+        """True once the dashboard has the report."""
         body = {"alertId": alert_id, "state": state, "observed": observed}
         if self.dry_run:
             print(f"  DRY RUN: would post {host} {json.dumps(body)}")
-            return
+            return True
         try:
             http_json("POST", "/api/alerts/quarantine/"
                       f"{urllib.parse.quote(host)}/applied", body)
             print(f"  posted {state} for {host}")
+            return True
         except Exception as e:
             print(f"ERROR: POST applied for {host} failed: {e}",
                   file=sys.stderr)
             self.ok = False
+            return False
 
     def set_cordon(self, node, on):
         """Cordon and mark the cordon ours (on), or lift both, in one patch.
@@ -168,17 +249,102 @@ class Actuator:
         # ponytail: stateless, so a lost cordon/taint counts as drift only once
         # the dashboard says quarantined; a hand uncordon during quarantining
         # is re-applied without the flag.
-        reapplied = want["stage"] == "quarantined" and not (cordoned and tainted)
+        reapplied = want["stage"] != "quarantining" and not (cordoned and tainted)
         if reapplied:
             print(f"  DRIFT: {name} had lost its "
                   f"{'cordon' if tainted else 'taint'}; re-applied")
-        pods = ci_pod_count(name)
+        pods = len(ci_pods(name))
         self.post(name, want["alertId"], "drained" if pods == 0 else "out",
                   {"cordoned": True, "tainted": True, "ciPods": pods,
                    "reapplied": reapplied})
 
+    def verified(self, node, want):
+        """Runs the return check one step per run; True once it passed.
+
+        Stateless like the rest: the pod is the state. A pass or failure
+        deletes it, so the next resolve starts a fresh check, and after a
+        failure no new one starts until a person resolves again.
+        """
+        name = node["metadata"]["name"]
+        if self.dry_run:
+            print(f"  DRY RUN: would run the return check on {name}")
+            return True
+        if want.get("actuatorState") == "verify_failed":
+            print(f"  {name} failed its return check; waiting for a resolve")
+            return False
+        pod_name = verify_pod_name(name)
+        try:
+            pod = json.loads(kubectl("get", "pod", pod_name, "-n", VERIFY_NS,
+                                     "-o", "json"))
+        except RuntimeError as e:
+            if "NotFound" not in str(e):
+                raise
+            # nodeName skips the scheduler, so the kubelet fails the pod at
+            # once if a GPU is still held or unhealthy: wait out the CI pods,
+            # and treat a GPU the device plugin dropped as a failed check.
+            # The wait is posted as 'out' every run, naming the jobs, so the
+            # dashboard can say which one holds the node.
+            pods = ci_pods(name)
+            if pods:
+                note = ci_wait_note(pods)
+                print(f"  {name}: {note}")
+                self.post(name, want["alertId"], "out",
+                          {"ciPods": len(pods), "note": note})
+                return False
+            # The device plugin may drop the resource entirely.
+            status = node["status"]
+            usable = status.get("allocatable", {}).get(GPU_RESOURCE, "0")
+            total = status.get("capacity", {}).get(GPU_RESOURCE, "0")
+            if usable != total:
+                note = f"only {usable} of {total} GPUs are usable"
+                print(f"  {name}: return check failed: {note}")
+                self.post(name, want["alertId"], "verify_failed", {"note": note})
+                return False
+            self.write("create", "-f", "-", input=json.dumps(verify_pod(node)))
+            self.post(name, want["alertId"], "verifying", {"phase": "Created"})
+            return False
+        phase = pod.get("status", {}).get("phase")
+        # strptime: the control planes' Python 3.10 fromisoformat rejects "Z".
+        created = datetime.datetime.strptime(
+            pod["metadata"]["creationTimestamp"], "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(tzinfo=datetime.timezone.utc)
+        age = datetime.datetime.now(datetime.timezone.utc) - created
+        # A pass counts only within the timeout: past it, this attempt has
+        # already failed, even if reporting that failure didn't get through.
+        if phase == "Succeeded" and age < VERIFY_TIMEOUT:
+            self.write("delete", "pod", pod_name, "-n", VERIFY_NS)
+            return True
+        if phase != "Failed" and age < VERIFY_TIMEOUT:
+            self.post(name, want["alertId"], "verifying", {"phase": phase})
+            return False
+        if phase == "Failed":
+            # A pod the kubelet rejected never ran, so it has no log; its
+            # status says why.
+            try:
+                lines = kubectl("logs", pod_name, "-n", VERIFY_NS,
+                                "--tail=20").strip().splitlines()
+            except RuntimeError:
+                status = pod.get("status", {})
+                lines = [" ".join(filter(None, (status.get("reason"),
+                                                status.get("message"))))]
+            note = " / ".join(lines[-3:])[:300] or "no output"
+        else:
+            minutes = VERIFY_TIMEOUT // datetime.timedelta(minutes=1)
+            note = f"did not finish in {minutes} min ({phase})"
+        print(f"  {name}: return check failed: {note}")
+        # The pod is the only record of the failure until the dashboard has
+        # it; deleting it first would let a lost post start a fresh check.
+        if self.post(name, want["alertId"], "verify_failed", {"note": note}):
+            self.write("delete", "pod", pod_name, "-n", VERIFY_NS,
+                       "--wait=false")
+        return False
+
     def bring_back(self, node, want):
         name = node["metadata"]["name"]
+        ours = (our_taint(node) is not None
+                or CORDON_MARK in (node["metadata"].get("annotations") or {}))
+        if ours and VERIFY_LEVEL != "0" and not self.verified(node, want):
+            return
         cordoned = bool(node["spec"].get("unschedulable"))
         if our_taint(node) is not None:
             self.write("taint", "nodes", name, f"{TAINT_KEY}:NoSchedule-")

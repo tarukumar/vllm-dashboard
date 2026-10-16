@@ -239,8 +239,10 @@ class QuarantineStageChange:
     from_stage: str
     patch: dict[str, Any]
     silent: bool = False
-    # Set for a post about the episode rather than a move to its next stage;
-    # only "actuator_stuck" so far.
+    # Set for a post about the episode rather than a plain move to its next
+    # stage: "actuator_stuck:<scan time>" or "verify_failed:<scan time>". A
+    # failed return check sends a resolve back, so an episode can see each
+    # more than once; the scan time keeps their delivery ids apart.
     notice: str | None = None
 
 
@@ -856,6 +858,14 @@ def plan_trigger_rules(
             )
         )
 
+    # A host waiting on its resolve needs one failing reading after it, not a
+    # streak: the resolve says it is fixed, so one fault proves otherwise.
+    waiting = {
+        host
+        for (_, host), episode in open_episodes.items()
+        if episode.details.get("stage") == "resolve_requested"
+    }
+
     def check(host: str, rule: str, failing: bool | None, at: datetime | None) -> bool:
         """Advance one host-fault streak; True when it trips this scan."""
         key = (kind, f"rule:{rule}:{host}")
@@ -873,7 +883,7 @@ def plan_trigger_rules(
         out_states.append(
             replace(state, consecutive_breaches=streak, last_reported_at=at)
         )
-        return streak >= HOST_FAULT_CHECKS
+        return streak >= (1 if host in waiting else HOST_FAULT_CHECKS)
 
     for fault in sorted(gpu_faults, key=lambda r: (r.hostname, r.gpu_index)):
         if fault.hostname not in pools or not fresh(fault.reported_at):
@@ -900,13 +910,22 @@ def plan_trigger_rules(
 
     # Xids stay within XID_WINDOW for a day, so a resolved host would trip
     # again on the Xid it was resolved for. A resolve covers every Xid up to
-    # the scan that saw it 'resolving'; only newer ones count after that.
+    # the request, so a new one while it waits for a clean reading still
+    # counts, and then up to the scan that saw it 'resolving', which covers
+    # any the actuator's return check raises.
     floors: dict[str, datetime] = {}
     for host in pools:
         key = (kind, f"rule:xid:{host}")
         state = states.get(key, InfraSubjectState(*key))
         episode = open_episodes.get((kind, host))
-        if episode is not None and episode.details.get("stage") == "resolving":
+        stage = episode.details.get("stage") if episode is not None else None
+        if episode is not None and stage == "resolve_requested":
+            requested = datetime.fromisoformat(
+                str(episode.details.get("resolve_requested_at"))
+            )
+            out_states.append(replace(state, last_reported_at=requested))
+            floors[host] = requested
+        elif stage == "resolving":
             out_states.append(replace(state, last_reported_at=now))
             floors[host] = now
         elif state.last_reported_at is not None:
@@ -973,9 +992,13 @@ def plan_trigger_rules(
     disk = thresholds.get(InfraAlertType.DISK_USAGE.value)
     dead = thresholds.get(InfraAlertType.GPU_DEAD_MEMORY.value)
     count = thresholds.get(InfraAlertType.GPU_COUNT.value)
-    checks = HOST_FAULT_CHECKS
     for host in sorted(pools):
         cluster, pool = pools[host]
+        checks = (
+            "after its resolve"
+            if host in waiting
+            else f"on {HOST_FAULT_CHECKS} consecutive checks"
+        )
         reading = latest.get(host)
         if reading is not None and check(
             host, "gpu_hang", reading.gpu_query_hung, reading.reported_at
@@ -983,7 +1006,7 @@ def plan_trigger_rules(
             decide(
                 host,
                 "gpu_hang",
-                f"the GPU query hung on {checks} consecutive checks",
+                f"the GPU query hung {checks}",
                 reading_at=reading.reported_at.isoformat(),
             )
 
@@ -1004,8 +1027,8 @@ def plan_trigger_rules(
             decide(
                 host,
                 "network",
-                "every network probe failed on "
-                f"{checks} consecutive checks while most of the pool passed",
+                f"every network probe failed {checks} while most of the pool "
+                "passed",
                 probes=len(reading.network_probes or []),
                 reading_at=reading.reported_at.isoformat(),
             )
@@ -1029,7 +1052,7 @@ def plan_trigger_rules(
                     host,
                     "disk",
                     f"disk {worst.mount_point} at {worst.used_percent:.0f}% "
-                    f"used on {checks} consecutive checks",
+                    f"used {checks}",
                     mount_point=worst.mount_point,
                     used_percent=round(worst.used_percent, 1),
                     threshold_percent=disk.threshold_value,
@@ -1050,8 +1073,7 @@ def plan_trigger_rules(
                     host,
                     "dead_memory",
                     f"{worst_gpu.dead_proc_mem_mb:.0f} MiB held by dead "
-                    f"processes on GPU {worst_gpu.gpu_index} on {checks} "
-                    "consecutive checks",
+                    f"processes on GPU {worst_gpu.gpu_index} {checks}",
                     gpu_index=worst_gpu.gpu_index,
                     dead_proc_mem_mb=worst_gpu.dead_proc_mem_mb,
                     threshold_mib=dead.threshold_value,
@@ -1074,7 +1096,7 @@ def plan_trigger_rules(
                     host,
                     "root_owned",
                     f"root-owned files in {len(slots or [])} checkout slot(s) "
-                    f"on {checks} consecutive checks",
+                    f"{checks}",
                     slots=len(slots or []),
                     reading_at=reading.reported_at.isoformat(),
                 )
@@ -1096,8 +1118,8 @@ def plan_trigger_rules(
                 decide(
                     host,
                     "gpu_count",
-                    f"{observed.observed_gpus} of {baseline} GPUs usable on "
-                    f"{checks} consecutive checks",
+                    f"{observed.observed_gpus} of {baseline} GPUs usable "
+                    f"{checks}",
                     observed_gpus=observed.observed_gpus,
                     baseline_gpus=baseline,
                     reading_at=observed.reported_at.isoformat(),
@@ -1117,23 +1139,62 @@ DRY_RUN_EXPIRY_SCANS = 2
 
 # The actuators run every minute; one that has not confirmed a quarantine
 # ('out') or a resolve ('returned') this long after the command is stuck, and
-# the host may be half out. Posted once per stage.
+# the host may be half out. Posted once per stage. 'verifying' is a resolve
+# still in the return check, which the actuator reports every run and times
+# out itself, so only reports that stop count.
 ACTUATOR_CONFIRM_TIMEOUT = timedelta(minutes=10)
+# A resolve waits for CI jobs still on the host before its return check, and
+# the actuator reports that wait ('out') every run. Past this long, one post
+# names the jobs, so a hung job doesn't hold the host out unexplained.
+CI_WAIT_NOTICE = timedelta(minutes=60)
 
 
 def _actuator_stuck(
     episode: InfraAlertEpisode, stage: Any, actuator: Any, now: datetime
-) -> bool:
-    if episode.details.get("actuator_stuck") == stage:
-        return False
+) -> str | None:
+    """Why the actuator needs a post: 'actuator', 'ci', or None."""
+    # Each is posted once per stage, and neither mutes the other.
+    stuck_posted = episode.details.get("actuator_stuck") == stage
+    if stuck_posted and not (stage == "resolving" and actuator == "out"):
+        return None
+    timeout, kind = ACTUATOR_CONFIRM_TIMEOUT, "actuator"
     if stage == "quarantining" and actuator not in ("out", "drained"):
         since = episode.details.get("commanded_at")
-    elif stage == "resolving" and actuator != "returned":
+    elif stage == "resolving" and actuator == "out":
+        reported = episode.details.get("actuator_state_at")
+        if (
+            not stuck_posted
+            and reported
+            and now - datetime.fromisoformat(str(reported)) >= timeout
+        ):
+            return kind
+        if episode.details.get("ci_wait_noticed"):
+            return None
+        since = episode.details.get("resolving_at") or episode.details.get(
+            "resolve_requested_at"
+        )
+        timeout, kind = CI_WAIT_NOTICE, "ci"
+    elif stage == "resolving" and actuator == "verifying":
+        since = episode.details.get("actuator_state_at")
+    elif stage == "resolving":
+        since = episode.details.get("resolving_at") or episode.details.get(
+            "resolve_requested_at"
+        )
+    elif stage == "resolve_requested":
+        # No fresh reading since the resolve: the reporter may be down.
         since = episode.details.get("resolve_requested_at")
     else:
-        return False
+        return None
     started = datetime.fromisoformat(str(since)) if since else episode.opened_at
-    return now - started >= ACTUATOR_CONFIRM_TIMEOUT
+    return kind if now - started >= timeout else None
+
+
+def _read_since_resolve(episode: InfraAlertEpisode, read_at: datetime | None) -> bool:
+    if read_at is None:
+        return False
+    return read_at > datetime.fromisoformat(
+        str(episode.details.get("resolve_requested_at"))
+    )
 
 
 def _stage_change(
@@ -1158,7 +1219,9 @@ def _stage_change(
 # in one scan plus the past hour points at the detector, not the hosts.
 FLEET_BREAKER_LIMIT = 3
 FLEET_BREAKER_WINDOW = timedelta(hours=1)
-OUT_STAGES = frozenset({"quarantining", "quarantined", "resolving"})
+OUT_STAGES = frozenset(
+    {"quarantining", "quarantined", "resolve_requested", "resolving"}
+)
 # Why a limit blocked a decision; it opens (or would open) as 'held'.
 # A host quarantined again this soon after a resolve was likely not fixed;
 # the post asks a person to look rather than resolve it the same way again.
@@ -1271,8 +1334,16 @@ def plan_quarantine(
     states: Mapping[tuple[str, str], InfraSubjectState],
     open_episodes: Mapping[tuple[str, str], InfraAlertEpisode],
     pool_sizes: Mapping[str, int] | None = None,
+    faults: Mapping[str, str] | None = None,
+    readings: Mapping[str, datetime] | None = None,
 ) -> InfraScanPlan:
     """Advance the quarantine sequence by one scan.
+
+    A resolve is 'resolve_requested' until a fresh reading taken after it:
+    `faults` (host -> reason of a reading-based trigger decision this scan)
+    sends it back to quarantined, otherwise the host's latest fresh reading
+    (`readings`) hands it to the actuator as 'resolving'. Job-failure
+    decisions don't gate it: a quarantined host runs no jobs to clear them.
 
     A decision for a host with no open quarantine opens one: 'would' in dry
     run or for a dry-run trigger, 'quarantining' when live, or 'held' when a
@@ -1410,9 +1481,62 @@ def plan_quarantine(
                 "fix": episode.details.get("resolve_reason"),
                 "reason": episode.details.get("reason"),
             }
-        elif episode is not None and _actuator_stuck(episode, stage, actuator, now):
-            change = _stage_change(episode, {"actuator_stuck": stage})
-            changes.append(replace(change, notice="actuator_stuck"))
+        elif stage == "resolve_requested" and host in (faults or {}):
+            changes.append(
+                replace(
+                    _stage_change(
+                        episode,
+                        {
+                            "stage": "quarantined",
+                            "verify_failed_at": now.isoformat(),
+                            "verify_note": (faults or {})[host],
+                            "verify_check": "reading",
+                            "actuator_stuck": None,
+                        },
+                    ),
+                    notice=f"verify_failed:{now.isoformat()}",
+                )
+            )
+        elif stage == "resolve_requested" and _read_since_resolve(
+            episode, (readings or {}).get(host)
+        ):
+            changes.append(
+                _stage_change(
+                    episode,
+                    {"stage": "resolving", "resolving_at": now.isoformat()},
+                    silent=True,
+                )
+            )
+        elif stage == "resolving" and actuator == "verify_failed":
+            # The host failed the actuator's return check and is still out.
+            observed = episode.details.get("actuator_observed")
+            change = _stage_change(
+                episode,
+                {
+                    "stage": "quarantined",
+                    "verify_failed_at": now.isoformat(),
+                    "verify_note": observed.get("note")
+                    if isinstance(observed, dict)
+                    else None,
+                    "verify_check": "return_check",
+                    # The next resolve gets its own confirm timer.
+                    "actuator_stuck": None,
+                    "ci_wait_noticed": None,
+                },
+            )
+            changes.append(replace(change, notice=f"verify_failed:{now.isoformat()}"))
+        elif episode is not None and (
+            stuck := _actuator_stuck(episode, stage, actuator, now)
+        ):
+            change = _stage_change(
+                episode,
+                {"ci_wait_noticed": True, "waiting_on_ci": True}
+                if stuck == "ci"
+                else {"actuator_stuck": stage, "waiting_on_ci": False},
+            )
+            changes.append(
+                replace(change, notice=f"actuator_stuck:{now.isoformat()}")
+            )
         if next_absent != absent:
             state_details["absent_scans"] = next_absent
         if state_details != state.details:
@@ -1496,6 +1620,106 @@ def plan_infra_scan(
         states=states,
         open_episodes=open_episodes,
     )
+    # When a host was last read in full, for a resolve waiting on a clean
+    # reading. A reading that says nothing proves nothing, so it takes a
+    # fresh row for every GPU the host has had (the GPU-count baseline), a
+    # host reading whose GPU query answered, and a new measurement of the
+    # fault the host was quarantined for, on the GPU or mount it was on. The
+    # oldest of these is when the host was read.
+    def fresh(reported_at: datetime) -> bool:
+        return now - reported_at <= READING_MAX_AGE
+
+    def remeasured(host: str, evidence: Mapping[str, Any]) -> list[datetime]:
+        """When the quarantined fault was last measured; [] if it wasn't."""
+        rule, gpu = evidence.get("rule"), evidence.get("gpu_index")
+        host_reading = next((r for r in host_faults or [] if r.hostname == host), None)
+        if rule == "recovery_action":
+            seen = [
+                g.reported_at
+                for g in gpu_faults or []
+                if (g.hostname, g.gpu_index) == (host, gpu)
+                and g.recovery_action is not None
+            ]
+        elif rule == "remapped_rows":
+            seen = [
+                g.reported_at
+                for g in gpu_faults or []
+                if (g.hostname, g.gpu_index) == (host, gpu)
+                and g.remapped_rows_failure is not None
+            ]
+        elif rule == "dead_memory":
+            seen = [
+                r.reported_at
+                for r in gpu_dead_memory
+                if (r.hostname, r.gpu_index) == (host, gpu)
+            ]
+        elif rule == "disk":
+            seen = [
+                m.reported_at
+                for m in disk_mounts
+                if m.hostname == host
+                and m.mount_point == evidence.get("mount_point")
+                and m.error is None
+            ]
+        elif rule == "network":
+            seen = (
+                [host_reading.reported_at]
+                if host_reading and host_reading.network_probes
+                else []
+            )
+        elif rule == "root_owned":
+            seen = (
+                [host_reading.reported_at]
+                if host_reading and host_reading.root_owned_slots is not None
+                else []
+            )
+        elif rule == "gpu_count":
+            seen = [r.reported_at for r in gpu_counts if r.hostname == host]
+        else:
+            return [now]  # nothing more to measure: a GPU hang or an Xid
+        return [t for t in seen if fresh(t)]
+
+    readings: dict[str, datetime] = {}
+    for host in {g.hostname for g in gpu_faults or []}:
+        gpus = [
+            g for g in gpu_faults or [] if g.hostname == host and fresh(g.reported_at)
+        ]
+        count = states.get((InfraAlertType.GPU_COUNT.value, f"gpu-count:{host}"))
+        baseline = int(count.details.get("baseline_gpus") or 0) if count else 0
+        host_reading = next((r for r in host_faults or [] if r.hostname == host), None)
+        if (
+            not gpus
+            or len({g.gpu_index for g in gpus}) < baseline
+            or host_reading is None
+            or host_reading.gpu_query_hung is not False
+            or not fresh(host_reading.reported_at)
+        ):
+            continue
+        episode = open_episodes.get((InfraAlertType.QUARANTINE.value, host))
+        evidence = episode.details.get("evidence") if episode is not None else None
+        fault = remeasured(host, evidence if isinstance(evidence, dict) else {})
+        if fault:
+            readings[host] = min(
+                *(g.reported_at for g in gpus), host_reading.reported_at, *fault
+            )
+    # A fault sends a waiting resolve back only when read after the request;
+    # one read before it is what the resolve says was fixed.
+    faults: dict[str, str] = {}
+    for rule_decision in rule_decisions:
+        host = rule_decision.host
+        episode = open_episodes.get((InfraAlertType.QUARANTINE.value, host))
+        seen = rule_decision.evidence.get("reading_at") or rule_decision.evidence.get(
+            "at"
+        )
+        if (
+            episode is not None
+            and episode.details.get("stage") == "resolve_requested"
+            and not _read_since_resolve(
+                episode, datetime.fromisoformat(str(seen)) if seen else None
+            )
+        ):
+            continue
+        faults.setdefault(host, rule_decision.reason)
     plans: list[InfraScanPlan] = [
         InfraScanPlan(states=tuple(rule_states)),
         plan_quarantine(
@@ -1505,6 +1729,8 @@ def plan_infra_scan(
             states=states,
             open_episodes=open_episodes,
             pool_sizes=_pool_sizes(pools or {}, open_episodes),
+            faults=faults,
+            readings=readings,
         ),
     ]
     unreporting = thresholds.get(InfraAlertType.UNREPORTING.value)
@@ -1638,6 +1864,18 @@ def _render_quarantine(episode: InfraAlertEpisode) -> str:
             + (f"\n{PAGE_NOTE}" if paged else "")
             + _repeat_note(episode)
         )
+    if stage == "quarantined" and episode.details.get("verify_check") == "reading":
+        fault = _escape(episode.details.get("verify_note"))
+        return (
+            f":x: *Quarantine* — {host} still reports a fault after its resolve "
+            f"and stays quarantined: {fault}\n{QUARANTINE_RUNBOOK}"
+        )
+    if stage == "quarantined" and episode.details.get("verify_failed_at"):
+        failure = _escape(episode.details.get("verify_note"))
+        return (
+            f":x: *Quarantine* — {host} failed its return check and stays "
+            f"quarantined: {failure}\n{QUARANTINE_RUNBOOK}"
+        )
     if stage == "quarantined":
         return f":no_entry: *Quarantine* — {host} is quarantined\n{QUARANTINE_RUNBOOK}"
     if stage == "resolved":
@@ -1666,11 +1904,26 @@ def _render_detector_suspect(episodes: list[InfraAlertEpisode]) -> str:
 
 def _render_actuator_stuck(episode: InfraAlertEpisode) -> str:
     host = _code(episode.subject_key)
+    minutes = ACTUATOR_CONFIRM_TIMEOUT // timedelta(minutes=1)
+    if episode.details.get("stage") == "resolve_requested":
+        return (
+            f":warning: *Quarantine* — {host} has had no fresh reading for "
+            f"{minutes} min since it was resolved, so it stays out. Check its "
+            "reporter."
+        )
+    if episode.details.get("waiting_on_ci"):
+        observed = episode.details.get("actuator_observed")
+        note = observed.get("note") if isinstance(observed, dict) else None
+        waited = CI_WAIT_NOTICE // timedelta(minutes=1)
+        return (
+            f":hourglass: *Quarantine* — {host} has waited {waited} min for CI "
+            "jobs still on it to finish before its return check, so it stays "
+            f"out: {_escape(note)}"
+        )
     if episode.details.get("stage") == "resolving":
         doing = "has not confirmed returning"
     else:
         doing = "has not confirmed taking out"
-    minutes = int(ACTUATOR_CONFIRM_TIMEOUT.total_seconds() // 60)
     return (
         f":warning: *Quarantine* — the actuator {doing} {host} after "
         f"{minutes} min; the host may be half out. Check the actuator on its "
@@ -1912,7 +2165,7 @@ def infra_notifications(
                 + (f":{change.notice}" if change.notice else ""),
                 text=(
                     _render_actuator_stuck(change.episode)
-                    if change.notice == "actuator_stuck"
+                    if str(change.notice).startswith("actuator_stuck:")
                     else _render_quarantine(change.episode)
                 ),
                 delivery_mode=delivery_mode,

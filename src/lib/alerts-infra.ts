@@ -167,12 +167,21 @@ const QUARANTINE_STAGES: Record<string, string> = {
   held: "Held by a safety limit",
   quarantining: "Quarantining once running jobs finish",
   quarantined: "Quarantined",
+  resolve_requested: "Resolve requested: waiting for a clean reading",
   resolving: "Resolving: returning to service",
   resolved: "Back in service",
 };
 
-/** Stages the operator resolve endpoint accepts (resolveQuarantine). */
-const RESOLVABLE_QUARANTINE_STAGES = new Set(["held", "quarantining", "quarantined"]);
+/**
+ * Stages the operator resolve endpoint accepts (resolveQuarantine); a resolve
+ * already waiting for a clean reading only with force.
+ */
+const RESOLVABLE_QUARANTINE_STAGES = new Set([
+  "held",
+  "quarantining",
+  "quarantined",
+  "resolve_requested",
+]);
 
 /** Whether an operator can resolve this episode from the dashboard. */
 export function isResolvableQuarantine(episode: InfraAlertEpisode): boolean {
@@ -198,9 +207,17 @@ function summarizeQuarantine(episode: InfraAlertEpisode): string {
     typeof observed === "object" && observed !== null
       ? stringDetail(observed as Record<string, unknown>, "note")
       : null;
+  // Kept by the worker when a resolve is sent back, by a fault still read
+  // after it or by the return check.
+  const verifyNote = stringDetail(details, "verify_note");
+  const bounced =
+    details.verify_check === "reading"
+      ? `Still reports a fault after its resolve, so it stays out: ${verifyNote}.`
+      : `Return check failed, so it stays out: ${verifyNote}.`;
   return [
     `${QUARANTINE_STAGES[stage] ?? `Stage ${stage}`}${reason ? `: ${reason}` : ""}.`,
     by ? `Resolved by ${by}.` : "",
+    verifyNote ? bounced : "",
     note ? `Actuator: ${note}` : "",
   ]
     .filter(Boolean)

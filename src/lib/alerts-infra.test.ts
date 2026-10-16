@@ -284,6 +284,10 @@ test("quarantine episodes read their stage, reason, resolver and actuator note",
     "Quarantined: Xid 79.",
   );
   assert.equal(
+    quarantine({ stage: "resolve_requested", reason: "Xid 79" }),
+    "Resolve requested: waiting for a clean reading: Xid 79.",
+  );
+  assert.equal(
     quarantine({
       stage: "resolving",
       reason: "Xid 79",
@@ -293,15 +297,36 @@ test("quarantine episodes read their stage, reason, resolver and actuator note",
     "Resolving: returning to service: Xid 79. Resolved by oncall. Actuator: left a person's cordon",
   );
   assert.equal(
+    quarantine({
+      stage: "quarantined",
+      reason: "Xid 79",
+      resolved_by: "oncall",
+      verify_note: "| Memory | Fail - GPU 3 |",
+    }),
+    "Quarantined: Xid 79. Resolved by oncall. " +
+      "Return check failed, so it stays out: | Memory | Fail - GPU 3 |.",
+  );
+  assert.equal(
+    quarantine({
+      stage: "quarantined",
+      reason: "Xid 79",
+      verify_note: "the GPU query hung after its resolve",
+      verify_check: "reading",
+    }),
+    "Quarantined: Xid 79. " +
+      "Still reports a fault after its resolve, so it stays out: " +
+      "the GPU query hung after its resolve.",
+  );
+  assert.equal(
     quarantine({ stage: "resolved", resolution: "decision_cleared" }, "resolved"),
     "Dry run closed: the trigger stopped firing.",
   );
 });
 
-test("only open held, quarantining or quarantined episodes offer resolve", () => {
+test("only open held, quarantining, quarantined or waiting episodes offer resolve", () => {
   const quarantine = (stage: string, status: "open" | "resolved" = "open") =>
     episode({ alertType: "quarantine", status, details: { stage } });
-  for (const stage of ["held", "quarantining", "quarantined"]) {
+  for (const stage of ["held", "quarantining", "quarantined", "resolve_requested"]) {
     assert.equal(isResolvableQuarantine(quarantine(stage)), true, stage);
   }
   for (const stage of ["would", "resolving"]) {

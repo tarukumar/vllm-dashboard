@@ -4,12 +4,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from alerting.infra import (
+    GpuFaultObservation,
+    HostFaultObservation,
     InfraAlertEpisode,
     InfraScanPlan,
+    DiskMountObservation,
+    GpuCountObservation,
+    GpuDeadMemoryObservation,
     InfraSubjectState,
     QuarantineDecision,
+    XidEvent,
     infra_notifications,
     plan_infra_scan,
     plan_quarantine,
@@ -694,3 +701,205 @@ def test_a_held_host_that_goes_ahead_is_recorded() -> None:
         "host-1": (NOW - timedelta(hours=1)).isoformat(),
         "host-2": NOW.isoformat(),
     }
+
+
+def waiting(
+    read_age: timedelta,
+    *,
+    requested_age: timedelta,
+    gpu_age: timedelta | None = None,
+    hung: bool | None = False,
+    rule: str | None = None,
+    probes: list[dict[str, Any]] | None = None,
+    slots: list[str] | None = None,
+    **scan: Any,
+) -> str:
+    """The stage after one scan of a resolve waiting on a host reading.
+
+    The GPU row is as old as the host reading unless `gpu_age` says otherwise.
+    `rule` is the trigger the host was quarantined for; `scan` overrides
+    plan_infra_scan arguments.
+    """
+    resolve = episode("host-1", "resolve_requested")
+    resolve.details["resolve_requested_at"] = (NOW - requested_age).isoformat()
+    # Quarantined for GPU 0 or the root mount, where the rule names one.
+    resolve.details["evidence"] = {"rule": rule, "gpu_index": 0, "mount_point": "/"}
+    reading = HostFaultObservation(
+        hostname="host-1",
+        gpu_query_hung=hung,
+        network_probes=probes,
+        root_owned_slots=slots,
+        reported_at=NOW - read_age,
+    )
+    gpu = GpuFaultObservation(
+        "host-1", 0, "None", False, NOW - (read_age if gpu_age is None else gpu_age)
+    )
+    result = plan_infra_scan(
+        now=NOW,
+        thresholds={},
+        expected_hosts=frozenset(),
+        latest_reports={},
+        gpu_temperatures=[],
+        open_episodes={("quarantine", "host-1"): resolve},
+        quarantine_live=True,
+        pools={"host-1": ("h200", "pool-a")},
+        **{
+            "disk_mounts": [],
+            "gpu_dead_memory": [],
+            "gpu_counts": [],
+            "states": {},
+            "host_faults": [reading],
+            "gpu_faults": [gpu],
+            **scan,
+        },
+    )
+    changes = result.stage_changes
+    return str(changes[0].episode.details["stage"]) if changes else "unchanged"
+
+
+def test_a_host_reading_newer_than_the_resolve_releases_it() -> None:
+    minute = timedelta(minutes=1)
+    assert waiting(timedelta(seconds=60), requested_age=minute * 2) == "resolving"
+    # Older than READING_MAX_AGE, or not newer than the request: still waits.
+    assert waiting(timedelta(seconds=61), requested_age=minute * 2) == "unchanged"
+    assert waiting(minute, requested_age=minute) == "unchanged"
+    # Both halves count, by the older of the two.
+    assert waiting(minute, requested_age=minute * 2, gpu_age=minute * 2) == "unchanged"
+    assert waiting(minute, requested_age=minute * 2, gpu_age=minute * 3) == "unchanged"
+    assert waiting(minute * 2, requested_age=minute * 2, gpu_age=minute) == "unchanged"
+    # A GPU query that didn't answer, or hung, doesn't release it.
+    assert waiting(minute, requested_age=minute * 2, hung=None) == "unchanged"
+
+
+def test_a_clean_reading_measures_the_fault_again_and_every_gpu() -> None:
+    m = timedelta(minutes=1)
+
+    def wait(rule: str | None, requested_age: timedelta = m * 2, **scan: Any) -> str:
+        return waiting(m, requested_age=requested_age, rule=rule, **scan)
+
+    # A GPU fault or Xid needs nothing beyond the full reading.
+    assert wait("xid") == "resolving"
+    assert wait("gpu_hang") == "resolving"
+    # Host faults wait for their own measurement, taken after the request.
+    assert wait("network") == "unchanged"
+    assert wait("network", probes=[]) == "unchanged"
+    assert wait("network", probes=[{"ok": True}]) == "resolving"
+    assert wait("root_owned") == "unchanged"
+    assert wait("root_owned", slots=[]) == "resolving"
+    mount = DiskMountObservation(
+        "host-1", "/", "/dev/sda1", "ext4", "system", 10, 100, None, NOW - m
+    )
+    assert wait("disk") == "unchanged"
+    assert wait("disk", disk_mounts=[replace(mount, error="EIO")]) == "unchanged"
+    assert wait("disk", disk_mounts=[mount]) == "resolving"
+    # Another mount reading fine says nothing about the full one.
+    assert (
+        wait("disk", disk_mounts=[replace(mount, mount_point="/data")]) == "unchanged"
+    )
+    assert (
+        wait(
+            "disk",
+            requested_age=m // 2,
+            disk_mounts=[mount],
+            gpu_faults=[GpuFaultObservation("host-1", 0, "None", False, NOW)],
+        )
+        == "unchanged"
+    )
+    assert (
+        wait("disk", disk_mounts=[replace(mount, reported_at=NOW - 2 * m)])
+        == "unchanged"
+    )
+    dead = GpuDeadMemoryObservation("host-1", 0, 0.0, NOW - m)
+    assert wait("dead_memory") == "unchanged"
+    assert wait("dead_memory", gpu_dead_memory=[dead]) == "resolving"
+    assert (
+        wait("dead_memory", gpu_dead_memory=[replace(dead, gpu_index=1)]) == "unchanged"
+    )
+    # A GPU fault needs that GPU's field read, not [N/A].
+    gpu0 = GpuFaultObservation("host-1", 0, "None", False, NOW - m)
+    assert wait("recovery_action", gpu_faults=[gpu0]) == "resolving"
+    assert (
+        wait("recovery_action", gpu_faults=[replace(gpu0, recovery_action=None)])
+        == "unchanged"
+    )
+    assert wait("remapped_rows", gpu_faults=[gpu0]) == "resolving"
+    assert (
+        wait("remapped_rows", gpu_faults=[replace(gpu0, remapped_rows_failure=None)])
+        == "unchanged"
+    )
+    assert (
+        wait("recovery_action", gpu_faults=[replace(gpu0, gpu_index=1)]) == "unchanged"
+    )
+    count = GpuCountObservation("host-1", 1, NOW - m)
+    assert wait("gpu_count") == "unchanged"
+    assert wait("gpu_count", gpu_counts=[count]) == "resolving"
+    # Every GPU the host has had must report; a dropped one keeps it waiting.
+    baseline = {
+        ("gpu_count", "gpu-count:host-1"): InfraSubjectState(
+            "gpu_count", "gpu-count:host-1", details={"baseline_gpus": 2}
+        )
+    }
+    assert wait("xid", states=baseline) == "unchanged"
+    two = [GpuFaultObservation("host-1", i, "None", False, NOW - m) for i in (0, 1)]
+    assert wait("xid", states=baseline, gpu_faults=two) == "resolving"
+    stale = [two[0], replace(two[1], reported_at=NOW - 2 * m)]
+
+    # Each GPU's own reading must postdate the request, not just the newest.
+    def two_gpus(*ages: timedelta) -> str:
+        rows = [replace(two[i], reported_at=NOW - age) for i, age in enumerate(ages)]
+        return waiting(timedelta(0), requested_age=m // 2, rule="xid", gpu_faults=rows)
+
+    assert two_gpus(timedelta(0), timedelta(0)) == "resolving"
+    assert two_gpus(timedelta(0), m) == "unchanged"
+    # Another host's GPU doesn't make up this host's count.
+    elsewhere = replace(two[1], hostname="host-0")
+    assert wait("xid", states=baseline, gpu_faults=[two[0], elsewhere]) == "unchanged"
+    assert wait("xid", states=baseline, gpu_faults=stale) == "unchanged"
+    # Another host short of GPUs doesn't hold this one up.
+    other = {
+        ("gpu_count", "gpu-count:host-0"): baseline[("gpu_count", "gpu-count:host-1")]
+    }
+    assert (
+        wait(
+            "xid",
+            states=other,
+            gpu_faults=[replace(two[0], hostname="host-0"), two[0]],
+        )
+        == "resolving"
+    )
+
+
+def test_a_new_xid_after_the_request_sends_a_resolve_back() -> None:
+    # The GPU fault was read before the request, so the resolve covers it;
+    # the Xid came after, so it doesn't.
+    resolve = episode("host-1", "resolve_requested")
+    requested = NOW - timedelta(seconds=30)
+    resolve.details["resolve_requested_at"] = requested.isoformat()
+    result = plan_infra_scan(
+        now=NOW,
+        thresholds={},
+        expected_hosts=frozenset(),
+        latest_reports={},
+        disk_mounts=[],
+        gpu_temperatures=[],
+        gpu_dead_memory=[],
+        gpu_counts=[],
+        states={},
+        open_episodes={("quarantine", "host-1"): resolve},
+        quarantine_live=True,
+        pools={"host-1": ("h200", "pool-a")},
+        gpu_faults=[GpuFaultObservation("host-1", 0, "Reset", False, requested)],
+        xid_events=[
+            XidEvent("host-1", "0000:01:00.0", 79, NOW - timedelta(seconds=10))
+        ],
+    )
+    [change] = result.stage_changes
+    assert change.episode.details["stage"] == "quarantined"
+    assert change.episode.details["verify_note"] == "Xid 79 on GPU 0000:01:00.0"
+
+
+def test_a_resolve_waiting_on_a_reading_still_holds_a_cap_slot() -> None:
+    result = plan(
+        [decision("host-2")], {"pool-a": 4}, [episode("host-1", "resolve_requested")]
+    )
+    assert opened(result) == {"host-2": ("held", "pool_cap")}
