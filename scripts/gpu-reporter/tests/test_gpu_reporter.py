@@ -378,17 +378,84 @@ def test_journalctl_failure_raises_and_leaves_cursor(reporter, monkeypatch, tmp_
 
 def test_find_root_owned_slots(reporter, tmp_path):
     import os
+    import pathlib
 
-    clean = tmp_path / "builds" / "slot-1" / "vllm" / "ci"
-    dirty = tmp_path / "builds" / "slot-2" / "vllm" / "ci"
-    clean.mkdir(parents=True)
-    (dirty / ".runtime-shard").mkdir(parents=True)
-    pattern = str(tmp_path / "builds" / "*" / "vllm" / "ci")
-    # The test user stands in for root; the empty slot has nothing to flag.
+    builds = tmp_path / "builds"
+    pattern = str(builds / "*" / "vllm" / "ci")
+
+    def slot(name, *paths, mode=0o755):
+        """A checkout with directories (each holding a file) at `paths`."""
+        ci = builds / name / "vllm" / "ci"
+        ci.mkdir(parents=True)
+        for rel in paths:
+            d = ci / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "f").write_text("x")
+            # Every directory on the way down gets the mode.
+            parts = pathlib.Path(rel).parts
+            for i in range(len(parts)):
+                os.chmod(ci.joinpath(*parts[: i + 1]), mode)
+        return ci
+
+    slot("clean")
+    # The 2026-09-30 failure: a job left a root:root 0755 directory the
+    # agent can't empty, so the next clone on that slot fails.
+    stuck = slot("stuck", ".runtime-shard")
+    # The recorders make theirs 0777 on purpose, all the way down, so the
+    # agent deletes them fine (seen on every H200 slot, 2026-10-18).
+    slot("recorders", ".kernrec", ".fnrec/run-1", mode=0o777)
+    deep = slot("deep", ".fnrec", mode=0o777)
+    (deep / ".fnrec" / "sub").mkdir()
+    (deep / ".fnrec" / "sub" / "f").write_text("x")
+    os.chmod(deep / ".fnrec" / "sub", 0o755)
+    # An empty directory or a root-owned file goes with its parent.
+    empty = builds / "empty" / "vllm" / "ci"
+    (empty / ".cache").mkdir(parents=True)
+    os.chmod(empty / ".cache", 0o755)
+    (empty / "root-file").write_text("x")
+
+    # A symlink is deleted on its own, whatever it points at.
+    outside = tmp_path / "outside"
+    (outside / "d").mkdir(parents=True)
+    (outside / "d" / "f").write_text("x")
+    os.chmod(outside / "d", 0o755)
+    linked = builds / "linked" / "vllm" / "ci"
+    linked.mkdir(parents=True)
+    (linked / "link").symlink_to(outside / "d")
+
+    # Writable but not searchable: the agent can't reach what's inside.
+    no_search = slot("no-search", ".cache", mode=0o766)
+    # Writable and searchable but not readable: rm -rf can't list it.
+    no_read = slot("no-read", ".cache", mode=0o733)
+    # Sticky: only an entry's owner may delete it, and root owns these.
+    sticky = slot("sticky", ".tmp", mode=0o1777)
+
+    # The test user stands in for root.
     assert reporter.find_root_owned_slots((pattern,), root_uid=os.getuid()) == [
-        str(dirty)]
+        str(deep), str(no_read), str(no_search), str(sticky), str(stuck)]
     assert reporter.find_root_owned_slots((pattern,), root_uid=os.getuid() + 1) == []
     assert reporter.find_root_owned_slots((str(tmp_path / "nope" / "*"),)) == []
+
+
+def test_a_root_owned_directory_that_cant_be_read_is_an_unknown_reading(
+        reporter, tmp_path):
+    import os
+
+    import pytest
+
+    ci = tmp_path / "builds" / "s1" / "vllm" / "ci"
+    locked = ci / ".fnrec" / "locked"
+    locked.mkdir(parents=True)
+    os.chmod(ci / ".fnrec", 0o777)
+    os.chmod(locked, 0o000)
+    try:
+        # The caller turns the error into a null reading, never a clean one.
+        with pytest.raises(PermissionError):
+            reporter.find_root_owned_slots(
+                (str(tmp_path / "builds" / "*" / "vllm" / "ci"),),
+                root_uid=os.getuid())
+    finally:
+        os.chmod(locked, 0o755)
 
 
 def run_main(reporter, monkeypatch, tmp_path, post_ok=True, **queries):
