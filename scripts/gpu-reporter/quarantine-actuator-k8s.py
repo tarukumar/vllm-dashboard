@@ -168,14 +168,22 @@ def verify_pod_name(node_name):
     return f"vllm-quarantine-verify-{node_name}"
 
 
-def verify_pod(node):
+# Which resolve a return-check pod belongs to: the episode's
+# resolve_requested_at, which every resolve sets anew.
+RESOLVE_MARK = "vllm-quarantine/resolve-requested-at"
+
+
+def verify_pod(node, resolve_requested_at=None):
     """The return-check pod: pinned to the node, holding all its GPUs."""
     name = node["metadata"]["name"]
     gpus = node["status"]["allocatable"][GPU_RESOURCE]
+    metadata = {"name": verify_pod_name(name), "namespace": VERIFY_NS,
+                "labels": {"app": "vllm-quarantine-verify"}}
+    if resolve_requested_at:
+        metadata["annotations"] = {RESOLVE_MARK: resolve_requested_at}
     return {
         "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": verify_pod_name(name), "namespace": VERIFY_NS,
-                     "labels": {"app": "vllm-quarantine-verify"}},
+        "metadata": metadata,
         "spec": {
             # nodeName skips the scheduler, so our cordon and taint don't
             # keep it off; the toleration covers the kubelet's own checks.
@@ -249,6 +257,13 @@ class Actuator:
         # ponytail: stateless, so a lost cordon/taint counts as drift only once
         # the dashboard says quarantined; a hand uncordon during quarantining
         # is re-applied without the flag.
+        # Before the post: the post overwrites the failed report this keys on,
+        # so a cleanup that fails must withhold it and be retried next run.
+        if want.get("actuatorState") == "verify_failed" and not self.dry_run:
+            if not self.drop_check_pod(name):
+                print(f"  {name}: failed check pod still deleting; "
+                      "report held back")
+                return
         reapplied = want["stage"] != "quarantining" and not (cordoned and tainted)
         if reapplied:
             print(f"  DRIFT: {name} had lost its "
@@ -257,6 +272,35 @@ class Actuator:
         self.post(name, want["alertId"], "drained" if pods == 0 else "out",
                   {"cordoned": True, "tainted": True, "ciPods": pods,
                    "reapplied": reapplied})
+
+    def drop_check_pod(self, name):
+        """Deletes a failed check's leftover pod, if its delete failed earlier.
+        True once the pod is gone.
+
+        The pod goes once the failure is posted. One that stayed would be
+        taken by the next resolve for its own check, failing it at once with
+        the old note. The dashboard keeps the failed report (and so this
+        runs) while the node waits in resolving, and after the worker moves
+        it back to quarantined, until a person resolves again or the next
+        report replaces it.
+        """
+        pod_name = verify_pod_name(name)
+
+        def present():
+            try:
+                kubectl("get", "pod", pod_name, "-n", VERIFY_NS, "-o", "json")
+            except RuntimeError as e:
+                if "NotFound" not in str(e):
+                    raise
+                return False
+            return True
+
+        if not present():
+            return True
+        self.write("delete", "pod", pod_name, "-n", VERIFY_NS, "--wait=false")
+        # The delete returns before the pod is gone. Say so, without waiting:
+        # the caller holds its post back and the next run looks again.
+        return not present()
 
     def verified(self, node, want):
         """Runs the return check one step per run; True once it passed.
@@ -269,10 +313,11 @@ class Actuator:
         if self.dry_run:
             print(f"  DRY RUN: would run the return check on {name}")
             return True
+        pod_name = verify_pod_name(name)
         if want.get("actuatorState") == "verify_failed":
             print(f"  {name} failed its return check; waiting for a resolve")
+            self.drop_check_pod(name)
             return False
-        pod_name = verify_pod_name(name)
         try:
             pod = json.loads(kubectl("get", "pod", pod_name, "-n", VERIFY_NS,
                                      "-o", "json"))
@@ -300,8 +345,17 @@ class Actuator:
                 print(f"  {name}: return check failed: {note}")
                 self.post(name, want["alertId"], "verify_failed", {"note": note})
                 return False
-            self.write("create", "-f", "-", input=json.dumps(verify_pod(node)))
+            self.write("create", "-f", "-", input=json.dumps(
+                verify_pod(node, want.get("resolveRequestedAt"))))
             self.post(name, want["alertId"], "verifying", {"phase": "Created"})
+            return False
+        # A pod from an earlier resolve (its failure posted, its delete lost)
+        # is not this resolve's result: remove it, and start fresh once gone.
+        stamp = (pod["metadata"].get("annotations") or {}).get(RESOLVE_MARK)
+        if stamp != want.get("resolveRequestedAt"):
+            print(f"  {name}: check pod is from an earlier resolve; removing it")
+            self.write("delete", "pod", pod_name, "-n", VERIFY_NS,
+                       "--wait=false")
             return False
         phase = pod.get("status", {}).get("phase")
         # strptime: the control planes' Python 3.10 fromisoformat rejects "Z".
