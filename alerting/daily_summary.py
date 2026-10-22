@@ -1,7 +1,7 @@
 """Daily CI infra summary: one Slack post a day about the pilot hosts.
 
 Changes since yesterday come first, then what stands (quarantined, held,
-degraded, not reporting), then a link to the /gpu page. Empty sections are
+cordoned, degraded, not reporting), then a link to the /gpu page. Empty sections are
 hidden, and a quiet day is one line so that a missing post means the job
 broke. It is operational only; nothing here feeds measurement.
 
@@ -88,6 +88,11 @@ class DailySummarySource(Protocol):
         fresh reading."""
         ...
 
+    def cordoned_hosts(self) -> dict[str, datetime]:
+        """Kubernetes node -> when its current cordon started, for nodes whose
+        latest fresh reading is unschedulable."""
+        ...
+
 
 @dataclass(frozen=True)
 class SummaryInputs:
@@ -100,6 +105,7 @@ class SummaryInputs:
     episodes: list[InfraAlertEpisode]
     scrape_buckets: Mapping[str, int]
     allocatable: Mapping[str, tuple[int, int]]
+    cordoned: Mapping[str, datetime]
 
 
 def _hm(value: datetime) -> str:
@@ -191,6 +197,10 @@ def render_summary(inputs: SummaryInputs) -> str:
 
     out = [e for e in quarantines if e.resolved_at is None and e.details.get("stage") in OUT_STAGES]
     held = [e for e in quarantines if e.resolved_at is None and e.details.get("stage") == "held"]
+    # A quarantine lists its own cordon; the rest were cordoned by hand.
+    cordoned = sorted(
+        (inputs.cordoned.keys() & inputs.pools.keys()) - {e.subject_key for e in out}
+    )
     degraded: list[str] = []
     for obs in sorted(inputs.gpu_counts, key=lambda o: o.hostname):
         if obs.hostname not in inputs.pools:
@@ -219,6 +229,11 @@ def render_summary(inputs: SummaryInputs) -> str:
     if held:
         standing.append("Held (waiting for a person or a free slot):")
         standing += [f"• {_code(e.subject_key)} ({_reason(e)})" for e in held]
+    if cordoned:
+        standing.append("Cordoned:")
+        standing += [
+            f"• {_code(host)} ({_age(inputs.cordoned[host], now)})" for host in cordoned
+        ]
     if degraded:
         standing += ["Degraded:", *degraded]
     if silent:
@@ -337,6 +352,7 @@ class DailySummaryHandler:
                 episodes=episodes,
                 scrape_buckets=buckets,
                 allocatable=allocatable,
+                cordoned=self._source.cordoned_hosts(),
             )
         )
         self._outbox.enqueue(
