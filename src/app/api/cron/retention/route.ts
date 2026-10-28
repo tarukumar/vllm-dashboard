@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/db";
 import { hasPostgresErrorCode } from "@/lib/postgres-errors";
+import { cronAuthError } from "@/lib/operator-auth";
 
 export const maxDuration = 55;
 
@@ -11,12 +12,12 @@ export const maxDuration = 55;
 // they are the long-range history source.
 // One-second job GPU samples are kept for 7 days; command/test spans remain.
 export async function GET(request: NextRequest) {
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret) {
-    const auth = request.headers.get("authorization");
-    if (auth !== `Bearer ${cronSecret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+  const authError = cronAuthError(request.headers.get("authorization"));
+  if (authError) {
+    return NextResponse.json(
+      { error: authError.error },
+      { status: authError.status },
+    );
   }
 
   try {
@@ -35,6 +36,10 @@ export async function GET(request: NextRequest) {
     const hostDeleted = await db`
       DELETE FROM host_snapshots
       WHERE reported_at < NOW() - INTERVAL '30 days'
+    `;
+    const xidDeleted = await db`
+      DELETE FROM gpu_xid_events
+      WHERE at < NOW() - INTERVAL '30 days'
     `;
     const agentDeleted = await db`
       DELETE FROM buildkite_agent_snapshots
@@ -56,6 +61,7 @@ export async function GET(request: NextRequest) {
       jobGpuSampleBatchesDeleted: jobGpuDeleted.count,
       gpuSnapshotsDeleted: gpuDeleted.count,
       hostSnapshotsDeleted: hostDeleted.count,
+      xidEventsDeleted: xidDeleted.count,
       agentSnapshotsDeleted: agentDeleted.count,
       evalSnapshotsDeleted: evalSnapshotsDeleted.count,
     });

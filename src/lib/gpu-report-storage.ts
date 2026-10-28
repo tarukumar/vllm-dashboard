@@ -1,9 +1,50 @@
 import type postgres from "postgres";
 import { getDb } from "@/lib/db";
-import type { NormalizedGpuReport } from "@/lib/gpu-report";
+import type { NormalizedGpuMetric, NormalizedGpuReport } from "@/lib/gpu-report";
 
 function jsonValue(value: unknown): postgres.JSONValue {
   return value as postgres.JSONValue;
+}
+
+/**
+ * One 5-minute rollup row per GPU model. GPUs that can't report utilization
+ * still count toward memory, so utilization keeps its own sample count.
+ */
+export function buildGpuRollups(
+  gpus: NormalizedGpuMetric[],
+  hostname: string,
+  bucket: Date,
+) {
+  const rollupsByName = new Map<
+    string,
+    { memPctSum: number; gpuUtilSum: number; gpuUtilCount: number; count: number }
+  >();
+  for (const gpu of gpus) {
+    const name = gpu.name ?? "Unknown";
+    const current = rollupsByName.get(name) ?? {
+      memPctSum: 0,
+      gpuUtilSum: 0,
+      gpuUtilCount: 0,
+      count: 0,
+    };
+    current.memPctSum +=
+      gpu.mem_total_mb > 0 ? (gpu.mem_used_mb / gpu.mem_total_mb) * 100 : 0;
+    if (gpu.gpu_util != null) {
+      current.gpuUtilSum += gpu.gpu_util;
+      current.gpuUtilCount += 1;
+    }
+    current.count += 1;
+    rollupsByName.set(name, current);
+  }
+  return [...rollupsByName.entries()].map(([gpuName, values]) => ({
+    time_bucket: bucket,
+    hostname,
+    gpu_name: gpuName,
+    mem_pct_sum: values.memPctSum,
+    gpu_util_sum: values.gpuUtilSum,
+    gpu_util_count: values.gpuUtilCount,
+    sample_count: values.count,
+  }));
 }
 
 /** Stores the raw GPU/host observations and both rollups atomically. */
@@ -27,33 +68,19 @@ export async function storeGpuReport(
     power_draw_w: gpu.power_draw_w,
     power_limit_w: gpu.power_limit_w,
     dead_proc_mem_mb: gpu.dead_proc_mem_mb,
+    recovery_action: gpu.recovery_action,
+    remapped_rows_failure: gpu.remapped_rows_failure,
+    ecc_uncorrected: gpu.ecc_uncorrected,
+  }));
+  const xidEvents = (report.xids ?? []).map((event) => ({
+    hostname: report.hostname,
+    bus_id: event.bus_id,
+    xid: event.xid,
+    at: event.at,
+    message: event.message,
   }));
 
-  const rollupsByName = new Map<
-    string,
-    { memPctSum: number; gpuUtilSum: number; count: number }
-  >();
-  for (const gpu of report.gpus) {
-    const name = gpu.name ?? "Unknown";
-    const current = rollupsByName.get(name) ?? {
-      memPctSum: 0,
-      gpuUtilSum: 0,
-      count: 0,
-    };
-    current.memPctSum +=
-      gpu.mem_total_mb > 0 ? (gpu.mem_used_mb / gpu.mem_total_mb) * 100 : 0;
-    current.gpuUtilSum += gpu.gpu_util;
-    current.count += 1;
-    rollupsByName.set(name, current);
-  }
-  const rollups = [...rollupsByName.entries()].map(([gpuName, values]) => ({
-    time_bucket: bucket,
-    hostname: report.hostname,
-    gpu_name: gpuName,
-    mem_pct_sum: values.memPctSum,
-    gpu_util_sum: values.gpuUtilSum,
-    sample_count: values.count,
-  }));
+  const rollups = buildGpuRollups(report.gpus, report.hostname, bucket);
 
   const host = report.host;
   const hostSnapshot = {
@@ -71,6 +98,21 @@ export async function storeGpuReport(
       report.node_conditions == null
         ? null
         : db.json(jsonValue(report.node_conditions)),
+    mig_slices: report.mig_slices,
+    root_owned_slots:
+      report.root_owned_slots == null
+        ? null
+        : db.json(jsonValue(report.root_owned_slots)),
+    allocatable_gpus: report.allocatable_gpus,
+    capacity_gpus: report.capacity_gpus,
+    gpu_query_hung: report.gpu_query_hung,
+    gpu_query_error: report.gpu_query_error,
+    docker_ok: report.docker_ok,
+    docker_error: report.docker_error,
+    network_probes:
+      report.network_probes == null
+        ? null
+        : db.json(jsonValue(report.network_probes)),
   };
   const cpuSampleCount = host?.cpu_util == null ? 0 : 1;
   const ramSampleCount = host?.ram_used_bytes == null ? 0 : 1;
@@ -112,7 +154,23 @@ export async function storeGpuReport(
           "power_draw_w",
           "power_limit_w",
           "dead_proc_mem_mb",
+          "recovery_action",
+          "remapped_rows_failure",
+          "ecc_uncorrected",
         )}
+      `;
+    }
+    if (xidEvents.length > 0) {
+      await tx`
+        INSERT INTO gpu_xid_events ${tx(
+          xidEvents,
+          "hostname",
+          "bus_id",
+          "xid",
+          "at",
+          "message",
+        )}
+        ON CONFLICT (hostname, bus_id, xid, at) DO NOTHING
       `;
     }
     if (rollups.length > 0) {
@@ -124,11 +182,14 @@ export async function storeGpuReport(
           "gpu_name",
           "mem_pct_sum",
           "gpu_util_sum",
+          "gpu_util_count",
           "sample_count",
         )}
         ON CONFLICT (time_bucket, hostname, gpu_name) DO UPDATE SET
           mem_pct_sum = gpu_history_5m.mem_pct_sum + EXCLUDED.mem_pct_sum,
           gpu_util_sum = gpu_history_5m.gpu_util_sum + EXCLUDED.gpu_util_sum,
+          gpu_util_count = COALESCE(gpu_history_5m.gpu_util_count, gpu_history_5m.sample_count)
+            + EXCLUDED.gpu_util_count,
           sample_count = gpu_history_5m.sample_count + EXCLUDED.sample_count
       `;
     }
@@ -146,6 +207,15 @@ export async function storeGpuReport(
         "reporter_status",
         "last_error",
         "node_conditions",
+        "mig_slices",
+        "root_owned_slots",
+        "allocatable_gpus",
+        "capacity_gpus",
+        "gpu_query_hung",
+        "gpu_query_error",
+        "network_probes",
+        "docker_ok",
+        "docker_error",
       )}
     `;
     await tx`

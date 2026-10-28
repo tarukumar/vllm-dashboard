@@ -150,7 +150,21 @@ def test_infra_timer_scans_every_five_minutes_without_sensitive_data() -> None:
 def test_run_worker_maps_infra_consumer_to_its_own_control_path() -> None:
     runner = read("bin/run-worker")
 
-    assert "infra) alert_path=infra ;;" in runner
+    assert "infra|daily-summary) alert_path=infra ;;" in runner
+
+
+def test_daily_summary_timer_posts_at_nine_pacific_without_sensitive_data() -> None:
+    timer = read("systemd/alerting-daily-summary.timer")
+    service = read("systemd/alerting-daily-summary.service")
+
+    assert "OnCalendar=*-*-* 09:00:00 America/Los_Angeles" in timer
+    assert "Persistent=true" in timer
+    assert "Unit=alerting-daily-summary.service" in timer
+    assert "run-worker daily-summary" in service
+    assert "StandardOutput=null" in service
+    assert "OnFailure=alerting-failure-notify@%n.service" in service
+    for sensitive_name in ("DATABASE_URL", "TOKEN", "PASSWORD"):
+        assert sensitive_name not in service + timer
 
 
 def test_main_ci_analysis_timer_runs_every_ten_minutes() -> None:
@@ -469,3 +483,128 @@ def test_failure_notifier_can_write_its_runtime_directory() -> None:
     unit = read("systemd/alerting-failure-notify@.service")
     assert "ProtectSystem=strict" in unit
     assert "ReadWritePaths=/run/alerting" in unit
+
+
+def test_secret_renderer_skips_a_bad_key_instead_of_refusing_the_secret() -> None:
+    """On 2026-10-12 a key saved as `BUILDKITE_WRITE_TOKEN,` made the renderer
+    reject the whole secret, so every unit failed and the failure notifier,
+    which loads the same secret, could not report it for 27 hours.
+    """
+    import json
+    import subprocess
+    import sys
+
+    secret = {"SLACK_BOT_TOKEN": "xoxb-1", "BUILDKITE_WRITE_TOKEN,": "bkua_x", "NESTED": {"a": 1}}
+    result = subprocess.run(
+        [sys.executable, str(AWS_DIR / "bin/render-secret-env")],
+        input=json.dumps({"SecretString": json.dumps(secret)}),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == "SLACK_BOT_TOKEN=xoxb-1\n"
+    assert "bkua_x" not in result.stderr
+    assert "BUILDKITE_WRITE_TOKEN," not in result.stderr
+    assert "skipping NESTED" in result.stderr
+
+
+def test_h200_pauser_runs_every_minute_in_dry_run_without_sensitive_data() -> None:
+    service = read("systemd/alerting-h200-pauser.service")
+    timer = read("systemd/alerting-h200-pauser.timer")
+    wrapper = read("bin/run-h200-pauser")
+    installer = read("install.sh")
+
+    assert "ExecStart=/opt/alerting/bin/run-h200-pauser --dry-run" in service
+    assert "ReadWritePaths=/run/alerting" in service
+    assert "OnUnitActiveSec=60" in timer
+    assert "Unit=alerting-h200-pauser.service" in timer
+    assert "/opt/alerting/bin/load-secrets" in wrapper
+    assert 'quarantine-pauser-h200.py "$@"' in wrapper
+    assert "bin/run-h200-pauser /opt/alerting/bin/run-h200-pauser" in installer
+    assert "quarantine-pauser-h200.py /opt/alerting/bin/quarantine-pauser-h200.py" in installer
+    # Enabled by hand per rollout, not by install or the S3 controls.
+    assert "alerting-h200-pauser.timer" not in installer
+    for sensitive_name in ("DATABASE_URL", "TOKEN", "SECRET", "PASSWORD"):
+        assert sensitive_name not in service + timer
+
+
+def _hold(tmp_path: Path, unit: str, error: str, state: dict | None, now: float) -> tuple[int, dict | None]:
+    import json
+    import subprocess
+    import sys
+
+    failure = tmp_path / "failure"
+    failure.write_text(f"infra_scan:run\n{error}\n")
+    state_path = tmp_path / "state.json"
+    if state is None:
+        state_path.unlink(missing_ok=True)
+    else:
+        state_path.write_text(json.dumps(state))
+    result = subprocess.run(
+        [sys.executable, str(AWS_DIR / "bin/hold-failure"), unit, str(failure), str(state_path)],
+        env={"HOLD_FAILURE_NOW": str(now)},
+        capture_output=True,
+        text=True,
+    )
+    after = json.loads(state_path.read_text()) if state_path.exists() else None
+    return result.returncode, after
+
+
+TIMEOUT = "canceling statement due to statement timeout"
+T0 = 1_792_653_600.0  # 2026-10-22 07:20 UTC
+
+
+def test_a_frequent_units_timeout_waits_ten_minutes_before_posting(tmp_path: Path) -> None:
+    """The database's disk saturates for ~20 min every morning (07:17-07:45
+    UTC); the scans time out once or twice and pass on the next run, and each
+    blip posted and resolved a Slack alert. A timeout now posts only once the
+    unit has kept failing for 10 minutes; the held runs still count."""
+    code, state = _hold(tmp_path, "alerting-infra.service", TIMEOUT, None, T0)
+    assert code == 0
+    assert state == {"since": "2026-10-22 07:20 UTC", "since_epoch": T0, "count": 1}
+
+    code, state = _hold(tmp_path, "alerting-infra.service", TIMEOUT, state, T0 + 599)
+    assert code == 0
+    assert state == {"since": "2026-10-22 07:20 UTC", "since_epoch": T0, "count": 2}
+
+    # Ten minutes on: post, carrying the episode's start and count forward.
+    code, after = _hold(tmp_path, "alerting-infra.service", TIMEOUT, state, T0 + 600)
+    assert (code, after) == (1, state)
+
+
+def test_only_timeouts_of_the_frequent_units_wait(tmp_path: Path) -> None:
+    for unit in ("alerting-main-ci.service", "alerting-h200-pauser.service"):
+        assert _hold(tmp_path, unit, TIMEOUT, None, T0)[0] == 0, unit
+    pauser = "desired set unavailable, changing nothing: The read operation timed out"
+    assert _hold(tmp_path, "alerting-h200-pauser.service", pauser, None, T0)[0] == 0
+
+    # A daily unit would wait until tomorrow; any other error is never a blip.
+    assert _hold(tmp_path, "alerting-daily-summary.service", TIMEOUT, None, T0) == (1, None)
+    assert _hold(tmp_path, "alerting-infra.service", "HTTP 401", None, T0) == (1, None)
+    # The pauser writes one line per failed host: one real error among
+    # timeouts must not be held, or a passing next run would clear it unseen.
+    mixed = f"{pauser}\nh200-ci-2: HTTP 401 Unauthorized"
+    assert _hold(tmp_path, "alerting-h200-pauser.service", mixed, None, T0) == (1, None)
+    both = f"{pauser}\n{pauser}"
+    assert _hold(tmp_path, "alerting-h200-pauser.service", both, None, T0)[0] == 0
+    # The run id on the first line is not an error.
+    assert _hold(tmp_path, "alerting-infra.service", "", None, T0) == (1, None)
+    held = {"since": "2026-10-22 07:20 UTC", "since_epoch": T0, "count": 1}
+    assert _hold(tmp_path, "alerting-infra.service", "HTTP 401", held, T0 + 60) == (1, held)
+
+
+def test_an_open_message_is_always_updated(tmp_path: Path) -> None:
+    posted = {"ts": "1.2", "channel": "C1", "text": "x", "since": "s", "count": 3}
+    assert _hold(tmp_path, "alerting-infra.service", TIMEOUT, posted, T0) == (1, posted)
+
+
+def test_the_notifier_holds_before_secrets_and_a_held_episode_resolves_silently() -> None:
+    script = read("bin/notify-failure")
+    hold = '/opt/alerting/bin/hold-failure "$unit" "$failure_file" "$state"'
+    assert hold in script
+    assert script.index(hold) < script.index("load-secrets")
+    # A held episode never posted: its recovery clears it without Slack.
+    silent = 'if [ "$mode" = resolve ] && ! grep -q \'"ts"\' "$state"; then'
+    assert silent in script
+    assert script.index(silent) < script.index("load-secrets")
+    assert "bin/hold-failure /opt/alerting/bin/hold-failure" in read("install.sh")

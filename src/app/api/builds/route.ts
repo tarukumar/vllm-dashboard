@@ -5,6 +5,7 @@ import { ensureTestAreaMapping } from "@/lib/test-areas";
 import { getCached, setCache } from "@/lib/api-cache";
 import { cachedJson } from "@/lib/api-response";
 import { resolveCiDataSource } from "@/lib/ci-data-source";
+import { SHARD_SUFFIX_SQL } from "@/lib/job-shards";
 import { enrichBuildAuthors } from "@/lib/github-build-authors";
 import { queryBuildsFromOtel } from "@/lib/otel-ci";
 
@@ -33,20 +34,22 @@ function parseBuildkiteBuildUrl(value: unknown) {
 
 function buildJobFilterSubquery(jobGroups: string[], jobNames: string[]): string {
   const nameConditions: string[] = [];
+  // Match a runtime-sharded step by its shards too (see job-shards.ts).
+  const step = `regexp_replace(jf.name, '${SHARD_SUFFIX_SQL}', '')`;
 
   if (jobNames.length > 0) {
     const escaped = jobNames.map((n) => `'${n.replace(/'/g, "''")}'`);
-    nameConditions.push(`jf.name IN (${escaped.join(",")})`);
+    nameConditions.push(`${step} IN (${escaped.join(",")})`);
   }
 
   if (jobGroups.length > 0) {
     const { exactNames, regexPatterns } = resolveGroupsToJobConditions(jobGroups);
     if (exactNames.length > 0) {
       const escaped = exactNames.map((n) => `'${n.replace(/'/g, "''")}'`);
-      nameConditions.push(`jf.name IN (${escaped.join(",")})`);
+      nameConditions.push(`${step} IN (${escaped.join(",")})`);
     }
     for (const pattern of regexPatterns) {
-      nameConditions.push(`jf.name RLIKE '${pattern.replace(/'/g, "''")}'`);
+      nameConditions.push(`${step} RLIKE '${pattern.replace(/'/g, "''")}'`);
     }
   }
 
@@ -115,7 +118,14 @@ export async function GET(request: NextRequest) {
       conditions.push(`b.created_at >= '${startDate.replace(/'/g, "''")}'`);
     }
     if (endDate) {
-      conditions.push(`b.created_at < DATE_ADD('${endDate.replace(/'/g, "''")}', 1)`);
+      // A date is inclusive; a full timestamp (from a drag-zoom on the
+      // chart) is the exact, exclusive end.
+      const end = endDate.replace(/'/g, "''");
+      conditions.push(
+        endDate.includes("T")
+          ? `b.created_at < '${end}'`
+          : `b.created_at < DATE_ADD('${end}', 1)`,
+      );
     }
     const where = conditions.join(" AND ");
     if (jobGroups.length > 0) {

@@ -118,6 +118,46 @@ def test_infra_timer_uses_its_scan_command(
     assert [command.command_type for command in runtime.commands] == ["infra_scan"]
 
 
+def test_daily_summary_timer_uses_its_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RecordingRuntime()
+    monkeypatch.setattr(worker, "_runtime", lambda *args: runtime)
+
+    assert worker.main(["daily-summary"]) == 0
+    assert [command.command_type for command in runtime.commands] == [
+        "daily_summary"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"), [(None, "UOPS"), ("C0CHANNEL", "C0CHANNEL")]
+)
+def test_daily_summary_goes_to_the_failure_dm_unless_a_destination_is_set(
+    monkeypatch: pytest.MonkeyPatch, summary: str | None, expected: str
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build(**kwargs: object) -> RecordingRuntime:
+        captured.update(kwargs)
+        return RecordingRuntime()
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/alerting")
+    monkeypatch.setenv("ALERTING_FAILURE_SLACK_DESTINATION", "UOPS")
+    if summary is None:
+        monkeypatch.delenv("SLACK_CI_INFRA_ALERT_CHANNEL", raising=False)
+    else:
+        monkeypatch.setenv("SLACK_CI_INFRA_ALERT_CHANNEL", summary)
+    monkeypatch.setenv("QUARANTINE_MODE", "live")
+    monkeypatch.setattr(worker, "build_daily_summary_runtime", fake_build)
+
+    worker._runtime("daily-summary", worker.SystemClock(), DeliveryMode.SHADOW)
+
+    assert captured["destination"] == expected
+    assert captured["delivery_mode"] is DeliveryMode.SHADOW
+    assert captured["quarantine_live"] is True
+
+
 def test_infra_runtime_passes_kubeconfigs_and_delivery_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,15 +170,19 @@ def test_infra_runtime_passes_kubeconfigs_and_delivery_mode(
     monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/alerting")
     monkeypatch.setenv("GPU_REPORTER_KUBECONFIG_H100", "/run/alerting/h100.conf")
     monkeypatch.setenv("GPU_REPORTER_KUBECONFIG_DGX", "/run/alerting/dgx.conf")
+    monkeypatch.setenv("BUILDKITE_TOKEN", "bk-token")
+    monkeypatch.setenv("ALERTING_FAILURE_SLACK_DESTINATION", "UOPS")
     monkeypatch.setattr(worker, "build_infra_runtime", fake_build)
 
     worker._runtime("infra", worker.SystemClock(), DeliveryMode.SHADOW)
 
+    assert captured["operator_destination"] == "UOPS"
     assert captured["kubeconfigs"] == [
         "/run/alerting/h100.conf",
         "/run/alerting/dgx.conf",
     ]
     assert captured["delivery_mode"] is DeliveryMode.SHADOW
+    assert captured["buildkite_token"] == "bk-token"
 
 
 def test_infra_runtime_skips_kubectl_sources_without_kubeconfigs(
@@ -153,6 +197,7 @@ def test_infra_runtime_skips_kubectl_sources_without_kubeconfigs(
     monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/alerting")
     monkeypatch.delenv("GPU_REPORTER_KUBECONFIG_H100", raising=False)
     monkeypatch.delenv("GPU_REPORTER_KUBECONFIG_DGX", raising=False)
+    monkeypatch.delenv("BUILDKITE_TOKEN", raising=False)
     monkeypatch.setattr(worker, "build_infra_runtime", fake_build)
 
     worker._runtime("infra", worker.SystemClock(), DeliveryMode.SHADOW)
@@ -160,6 +205,8 @@ def test_infra_runtime_skips_kubectl_sources_without_kubeconfigs(
     # No kubectl sources: the worker's egress SG cannot reach the cluster
     # API servers, so kubeconfigs are optional and unset means "skip".
     assert captured["kubeconfigs"] == []
+    # Likewise the job-failure trigger: no token, no trigger.
+    assert captured["buildkite_token"] is None
 
 
 def _set_analysis_environment(monkeypatch: pytest.MonkeyPatch) -> None:

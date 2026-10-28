@@ -6,6 +6,7 @@ path.
 """
 
 import shutil
+import subprocess
 import time
 
 HOST_KEYS = {
@@ -157,8 +158,9 @@ def test_nvidia_smi_failure_posts_degraded_payload(reporter, monkeypatch):
     # gpus=[], reporter_status="degraded" and a non-null last_error.
     calls = {}
 
-    def fake_report(gpus, host, status, last_error):
-        calls.update(gpus=gpus, host=host, status=status, last_error=last_error)
+    def fake_report(gpus, host, status, last_error, faults=None):
+        calls.update(gpus=gpus, host=host, status=status, last_error=last_error,
+                     faults=faults)
 
     def boom():
         raise RuntimeError("nvidia-smi failed: not found")
@@ -166,6 +168,12 @@ def test_nvidia_smi_failure_posts_degraded_payload(reporter, monkeypatch):
     monkeypatch.setattr(reporter, "REPORT_URL", "http://dummy")
     monkeypatch.setattr(reporter, "report", fake_report)
     monkeypatch.setattr(reporter, "query_gpus", boom)
+    monkeypatch.setattr(reporter, "query_xids", lambda path: ([], None))
+    monkeypatch.setattr(reporter, "query_mig_slices", lambda: 0)
+    monkeypatch.setattr(reporter, "find_root_owned_slots", lambda: [])
+    monkeypatch.setattr(reporter, "check_docker",
+                        lambda: (False, "the docker0 bridge is missing"))
+    monkeypatch.setattr(reporter, "NETWORK_PROBES", ())
     monkeypatch.setattr(reporter, "collect_host_metrics", lambda: {
         "cpu_util": 1.0, "cpu_count": 8, "ram_used_bytes": 1,
         "ram_total_bytes": 2, "ram_available_bytes": 1, "disks": [],
@@ -177,6 +185,14 @@ def test_nvidia_smi_failure_posts_degraded_payload(reporter, monkeypatch):
     assert calls["last_error"] == "nvidia-smi failed: not found"
     assert calls["gpus"] == []
     assert set(calls["host"]) == HOST_KEYS
+    # nvidia-smi -L is skipped once nvidia-smi has failed; Xids still flow.
+    # The failed query is a hang, sent as an explicit failing value.
+    assert calls["faults"] == {
+        "xids": [], "mig_slices": None, "root_owned_slots": [],
+        "gpu_query_hung": True, "gpu_query_error": "nvidia-smi failed: not found",
+        "docker_ok": False, "docker_error": "the docker0 bridge is missing",
+        "network_probes": [],
+    }
 
 
 def test_report_payload_top_level_keys(reporter, monkeypatch):
@@ -208,3 +224,613 @@ def test_report_payload_top_level_keys(reporter, monkeypatch):
                          "last_error"}
     assert sent["reporter_status"] == "ok"
     assert sent["last_error"] is None
+
+
+# --- hardware-fault readings -------------------------------------------------
+
+# Captured from a MIG-mode H200 host: remap is [N/A], ECC reads 0.
+FAULT_QUERY_MIG = "\n".join(
+    f"{i}, None, [N/A], 0" for i in range(8)
+)
+FAULT_QUERY_MIXED = "\n".join([
+    "0, None, No, 0",
+    "1, GPU Reset, Yes, 12",
+    "2, [Not Supported], [Not Supported], [Not Supported]",
+    "3, Node Reboot, 1, [N/A]",
+])
+
+NVIDIA_SMI_L_MIG = "\n".join([
+    "GPU 0: NVIDIA H200 (UUID: GPU-8800a3cd-38c6-154e-6fa4-d736a65e5535)",
+    "  MIG 1g.35gb     Device  0: (UUID: MIG-a280c447-dfd8-519d-a151-88ac82b0a056)",
+    "  MIG 1g.35gb     Device  1: (UUID: MIG-495c7ac0-6b37-54e9-8508-47707b9ca404)",
+    "GPU 1: NVIDIA H200 (UUID: GPU-0f026f38-fd99-c806-7633-6f5cf38f5ade)",
+    "  MIG 1g.35gb     Device  0: (UUID: MIG-ead74451-97af-5b6d-9a86-3da61df40ba9)",
+])
+NVIDIA_SMI_L_PLAIN = "\n".join(
+    f"GPU {i}: NVIDIA H200 (UUID: GPU-{i})" for i in range(8)
+)
+
+
+def journal_line(message, usec, cursor):
+    import json
+
+    return json.dumps({
+        "MESSAGE": message,
+        "__REALTIME_TIMESTAMP": str(usec),
+        "__CURSOR": cursor,
+    })
+
+
+JOURNAL_FIXTURE = "\n".join([
+    journal_line("usb 1-1: new high-speed USB device", 1_760_000_000_000_000, "c1"),
+    journal_line("NVRM: Xid (PCI:0000:7f:00): 43, pid=3696418, name=VLLM::EngineCor, "
+                 "channel 0x09000046", 1_760_000_001_500_000, "c2"),
+    journal_line("NVRM: Xid (PCI:0003:00:01): 79, GPU has fallen off the bus.",
+                 1_760_000_002_000_000, "c3"),
+    journal_line("NVRM: Xid (PCI:0000:3b:00): 48", 1_760_000_003_000_000, "c4"),
+    "not json at all",
+    journal_line("eth0: link up", 1_760_000_004_000_000, "c5"),
+])
+
+
+def test_parse_fault_query_mig_remap_is_null_not_false(reporter):
+    faults = reporter.parse_fault_query(FAULT_QUERY_MIG)
+    assert sorted(faults) == list(range(8))
+    assert faults[3] == {
+        "recovery_action": "None",
+        "remapped_rows_failure": None,
+        "ecc_uncorrected": 0,
+    }
+
+
+def test_parse_fault_query_values_and_unreadable_cells(reporter):
+    faults = reporter.parse_fault_query(FAULT_QUERY_MIXED)
+    assert faults[0] == {"recovery_action": "None", "remapped_rows_failure": False,
+                         "ecc_uncorrected": 0}
+    assert faults[1] == {"recovery_action": "GPU Reset", "remapped_rows_failure": True,
+                         "ecc_uncorrected": 12}
+    assert faults[2] == {"recovery_action": None, "remapped_rows_failure": None,
+                         "ecc_uncorrected": None}
+    assert faults[3]["remapped_rows_failure"] is True
+    assert faults[3]["ecc_uncorrected"] is None
+
+
+def test_count_mig_slices(reporter):
+    assert reporter.count_mig_slices(NVIDIA_SMI_L_MIG) == 3
+    assert reporter.count_mig_slices(NVIDIA_SMI_L_PLAIN) == 0
+
+
+def test_parse_xid_events(reporter):
+    xids, last_cursor = reporter.parse_xid_events(JOURNAL_FIXTURE)
+    assert last_cursor == "c5"
+    assert xids == [
+        {"bus_id": "0000:7f:00", "xid": 43,
+         "at": "2025-10-09T08:53:21.500000+00:00",
+         "message": "pid=3696418, name=VLLM::EngineCor, channel 0x09000046"},
+        {"bus_id": "0003:00:01", "xid": 79,
+         "at": "2025-10-09T08:53:22.000000+00:00",
+         "message": "GPU has fallen off the bus."},
+        {"bus_id": "0000:3b:00", "xid": 48,
+         "at": "2025-10-09T08:53:23.000000+00:00", "message": ""},
+    ]
+
+
+def test_parse_xid_events_caps_and_keeps_the_rest_for_next_read(reporter, monkeypatch):
+    monkeypatch.setattr(reporter, "MAX_XIDS_PER_REPORT", 2)
+    xids, last_cursor = reporter.parse_xid_events(JOURNAL_FIXTURE)
+    assert [x["xid"] for x in xids] == [43, 79]
+    # Cursor stops before the third Xid, so --after-cursor resumes at it.
+    assert last_cursor == "c3"
+
+
+def fake_journalctl(monkeypatch, reporter, stdout="", returncode=0):
+    calls = []
+
+    class Result:
+        pass
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        result = Result()
+        result.stdout, result.stderr, result.returncode = stdout, "boom", returncode
+        return result
+
+    monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+    return calls
+
+
+def test_first_run_reads_only_from_now(reporter, monkeypatch, tmp_path):
+    calls = fake_journalctl(monkeypatch, reporter, stdout=JOURNAL_FIXTURE)
+    xids, cursor = reporter.query_xids(str(tmp_path / "journal.cursor"))
+    assert xids == []  # history is never replayed
+    assert cursor == "c5"
+    assert calls[0][-2:] == ["-n", "1"]
+
+
+def test_later_run_resumes_after_saved_cursor(reporter, monkeypatch, tmp_path):
+    path = tmp_path / "state" / "journal.cursor"
+    reporter.write_cursor("c1", str(path))
+    assert reporter.read_cursor(str(path)) == "c1"
+    calls = fake_journalctl(monkeypatch, reporter, stdout=JOURNAL_FIXTURE)
+    xids, cursor = reporter.query_xids(str(path))
+    assert calls[0][-3:] == ["--after-cursor=c1", "-n", "+10000"]
+    assert len(xids) == 3
+    assert cursor == "c5"
+
+
+def test_no_new_log_lines_leaves_nothing_to_save(reporter, monkeypatch, tmp_path):
+    path = tmp_path / "journal.cursor"
+    reporter.write_cursor("c9", str(path))
+    fake_journalctl(monkeypatch, reporter, stdout="")
+    assert reporter.query_xids(str(path)) == ([], None)
+
+
+def test_journalctl_failure_raises_and_leaves_cursor(reporter, monkeypatch, tmp_path):
+    import pytest
+
+    path = tmp_path / "journal.cursor"
+    reporter.write_cursor("c1", str(path))
+    fake_journalctl(monkeypatch, reporter, returncode=1)
+    with pytest.raises(RuntimeError):
+        reporter.query_xids(str(path))
+    assert reporter.read_cursor(str(path)) == "c1"
+
+
+def test_find_root_owned_slots(reporter, tmp_path):
+    import os
+    import pathlib
+
+    builds = tmp_path / "builds"
+    pattern = str(builds / "*" / "vllm" / "ci")
+
+    def slot(name, *paths, mode=0o755):
+        """A checkout with directories (each holding a file) at `paths`."""
+        ci = builds / name / "vllm" / "ci"
+        ci.mkdir(parents=True)
+        for rel in paths:
+            d = ci / rel
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "f").write_text("x")
+            # Every directory on the way down gets the mode.
+            parts = pathlib.Path(rel).parts
+            for i in range(len(parts)):
+                os.chmod(ci.joinpath(*parts[: i + 1]), mode)
+        return ci
+
+    slot("clean")
+    # The 2026-09-30 failure: a job left a root:root 0755 directory the
+    # agent can't empty, so the next clone on that slot fails.
+    stuck = slot("stuck", ".runtime-shard")
+    # The recorders make theirs 0777 on purpose, all the way down, so the
+    # agent deletes them fine (seen on every H200 slot, 2026-10-18).
+    slot("recorders", ".kernrec", ".fnrec/run-1", mode=0o777)
+    deep = slot("deep", ".fnrec", mode=0o777)
+    (deep / ".fnrec" / "sub").mkdir()
+    (deep / ".fnrec" / "sub" / "f").write_text("x")
+    os.chmod(deep / ".fnrec" / "sub", 0o755)
+    # An empty directory or a root-owned file goes with its parent.
+    empty = builds / "empty" / "vllm" / "ci"
+    (empty / ".cache").mkdir(parents=True)
+    os.chmod(empty / ".cache", 0o755)
+    (empty / "root-file").write_text("x")
+
+    # A symlink is deleted on its own, whatever it points at.
+    outside = tmp_path / "outside"
+    (outside / "d").mkdir(parents=True)
+    (outside / "d" / "f").write_text("x")
+    os.chmod(outside / "d", 0o755)
+    linked = builds / "linked" / "vllm" / "ci"
+    linked.mkdir(parents=True)
+    (linked / "link").symlink_to(outside / "d")
+
+    # Writable but not searchable: the agent can't reach what's inside.
+    no_search = slot("no-search", ".cache", mode=0o766)
+    # Writable and searchable but not readable: rm -rf can't list it.
+    no_read = slot("no-read", ".cache", mode=0o733)
+    # Sticky: only an entry's owner may delete it, and root owns these.
+    sticky = slot("sticky", ".tmp", mode=0o1777)
+
+    # The test user stands in for root.
+    assert reporter.find_root_owned_slots((pattern,), root_uid=os.getuid()) == [
+        str(deep), str(no_read), str(no_search), str(sticky), str(stuck)]
+    assert reporter.find_root_owned_slots((pattern,), root_uid=os.getuid() + 1) == []
+    assert reporter.find_root_owned_slots((str(tmp_path / "nope" / "*"),)) == []
+
+
+def test_a_root_owned_directory_that_cant_be_read_is_an_unknown_reading(
+        reporter, tmp_path):
+    import os
+
+    import pytest
+
+    ci = tmp_path / "builds" / "s1" / "vllm" / "ci"
+    locked = ci / ".fnrec" / "locked"
+    locked.mkdir(parents=True)
+    os.chmod(ci / ".fnrec", 0o777)
+    os.chmod(locked, 0o000)
+    try:
+        # The caller turns the error into a null reading, never a clean one.
+        with pytest.raises(PermissionError):
+            reporter.find_root_owned_slots(
+                (str(tmp_path / "builds" / "*" / "vllm" / "ci"),),
+                root_uid=os.getuid())
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def run_main(reporter, monkeypatch, tmp_path, post_ok=True, **queries):
+    sent = {}
+
+    def fake_report(gpus, host, status, last_error, faults=None):
+        if not post_ok:
+            raise OSError("down")
+        sent.update(gpus=gpus, faults=faults)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(reporter, "REPORT_URL", "http://dummy")
+    monkeypatch.setattr(reporter, "JOURNAL_CURSOR_FILE", str(tmp_path / "journal.cursor"))
+    monkeypatch.setattr(reporter, "report", fake_report)
+    monkeypatch.setattr(reporter, "NETWORK_PROBES", ())
+    monkeypatch.setattr(reporter, "collect_host_metrics", lambda: {})
+    monkeypatch.setattr(reporter, "query_gpus", lambda: [
+        {"index": 0, "gpu_util": 10.0, "dead_proc_mem_mb": None, "recovery_action": None,
+         "remapped_rows_failure": None, "ecc_uncorrected": None}])
+    monkeypatch.setattr(reporter, "query_dead_proc_memory", lambda: {0: 0.0})
+    monkeypatch.setattr(reporter, "query_fault_fields", queries.get("fault", lambda: {
+        0: {"recovery_action": "None", "remapped_rows_failure": False,
+            "ecc_uncorrected": 0}}))
+    monkeypatch.setattr(reporter, "query_xids", queries.get("xids", boom))
+    monkeypatch.setattr(reporter, "query_mig_slices", queries.get("mig", boom))
+    monkeypatch.setattr(reporter, "find_root_owned_slots", queries.get("slots", boom))
+    monkeypatch.setattr(reporter, "check_docker", queries.get("docker", boom))
+    try:
+        reporter.main()
+    except SystemExit:
+        pass
+    return sent
+
+
+def test_each_failed_query_reports_null_independently(reporter, monkeypatch, tmp_path):
+    def boom():
+        raise RuntimeError("query failed")
+
+    sent = run_main(reporter, monkeypatch, tmp_path, fault=boom,
+                    mig=lambda: 12)  # xids, slots and the Docker check fail
+    assert sent["faults"] == {"xids": None, "mig_slices": 12, "root_owned_slots": None,
+                              "gpu_query_hung": False, "gpu_query_error": None,
+                              "docker_ok": None, "docker_error": None,
+                              "network_probes": []}
+    gpu = sent["gpus"][0]
+    assert gpu["recovery_action"] is None
+    assert gpu["remapped_rows_failure"] is None
+    assert gpu["ecc_uncorrected"] is None
+
+
+def test_successful_queries_fill_the_payload(reporter, monkeypatch, tmp_path):
+    sent = run_main(reporter, monkeypatch, tmp_path,
+                    xids=lambda path: ([{"bus_id": "0000:7f:00", "xid": 48,
+                                    "at": "2026-10-11T00:00:00.000000+00:00",
+                                    "message": ""}], "c7"),
+                    mig=lambda: 0, slots=lambda: ["/mnt/x/vllm/ci"])
+    assert sent["faults"]["xids"][0]["xid"] == 48
+    assert sent["faults"]["mig_slices"] == 0
+    assert sent["faults"]["root_owned_slots"] == ["/mnt/x/vllm/ci"]
+    assert sent["gpus"][0]["recovery_action"] == "None"
+    assert sent["gpus"][0]["remapped_rows_failure"] is False
+    assert reporter.read_cursor(reporter.JOURNAL_CURSOR_FILE) == "c7"
+
+
+def test_cursor_is_not_saved_when_the_post_fails(reporter, monkeypatch, tmp_path):
+    run_main(reporter, monkeypatch, tmp_path, post_ok=False,
+             xids=lambda path: ([], "c7"), mig=lambda: 0, slots=lambda: [])
+    assert reporter.read_cursor(reporter.JOURNAL_CURSOR_FILE) is None
+
+
+# --- GPU hang and network probes ---------------------------------------------
+
+def test_gpu_query_past_the_hang_timeout_reports_hung(reporter, monkeypatch, tmp_path):
+    import subprocess
+
+    def hung(cmd, **kwargs):
+        assert kwargs["timeout"] == reporter.GPU_HANG_TIMEOUT
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(reporter.subprocess, "run", hung)
+    sent = {}
+    monkeypatch.setattr(reporter, "REPORT_URL", "http://dummy")
+    monkeypatch.setattr(reporter, "JOURNAL_CURSOR_FILE", str(tmp_path / "c"))
+    monkeypatch.setattr(reporter, "NETWORK_PROBES", ())
+    monkeypatch.setattr(reporter, "collect_host_metrics", lambda: {})
+    monkeypatch.setattr(reporter, "query_xids", lambda path: ([], None))
+    monkeypatch.setattr(reporter, "find_root_owned_slots", lambda: [])
+    monkeypatch.setattr(reporter, "check_docker", lambda: (True, None))
+    monkeypatch.setattr(reporter, "report",
+                        lambda gpus, host, status, err, faults: sent.update(faults))
+    reporter.main()
+    assert sent["gpu_query_hung"] is True
+    assert "timed out after 30 seconds" in sent["gpu_query_error"]
+
+
+def test_probe_counts_any_http_answer_as_reached(reporter, monkeypatch):
+    import urllib.error
+
+    def unauthorized(req, timeout):
+        assert req.get_method() == "HEAD"
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(reporter.urllib.request, "urlopen", unauthorized)
+    result = reporter.probe("https://public.ecr.aws/v2/")
+    assert result["ok"] is True and result["error"] is None
+    assert result["latency_ms"] >= 0
+
+
+def test_probe_error_kinds(reporter):
+    import socket
+    import ssl
+    import urllib.error
+
+    kind = reporter.probe_error_kind
+    assert kind(urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))) == "dns"
+    assert kind(urllib.error.URLError(TimeoutError("timed out"))) == "timeout"
+    assert kind(TimeoutError("read timed out")) == "timeout"
+    assert kind(urllib.error.URLError(ssl.SSLError("bad cert"))) == "tls"
+    assert kind(urllib.error.URLError(ConnectionRefusedError(111, "refused"))) == "connect"
+    assert kind(ValueError("unknown url type")) == "other"
+
+
+def test_network_probes_run_together_and_stuck_ones_time_out(reporter, monkeypatch):
+    def fake_probe(url):
+        if url == "stuck":
+            time.sleep(5)
+        return {"ok": url == "up", "error": None if url == "up" else "dns",
+                "latency_ms": 1 if url == "up" else None}
+
+    monkeypatch.setattr(reporter, "probe", fake_probe)
+    monkeypatch.setattr(reporter, "NETWORK_PROBE_TIMEOUT", 0)
+    start = time.monotonic()
+    results = reporter.finish_network_probes(reporter.start_network_probes(
+        (("a", "up"), ("b", "down"), ("c", "stuck"))))
+    assert time.monotonic() - start < 2  # one shared deadline, not one each
+    assert results == [
+        {"target": "a", "ok": True, "error": None, "latency_ms": 1},
+        {"target": "b", "ok": False, "error": "dns", "latency_ms": None},
+        {"target": "c", "ok": False, "error": "timeout", "latency_ms": None},
+    ]
+
+
+def test_check_docker(reporter, monkeypatch, tmp_path):
+    assert reporter.DOCKER_BRIDGE == "/sys/class/net/docker0"
+    bridge = tmp_path / "docker0"
+    monkeypatch.setattr(reporter, "DOCKER_BRIDGE", str(bridge))
+    monkeypatch.setattr(reporter.shutil, "which",
+                        lambda name: "/usr/bin/docker" if name != "docker" else None)
+    # A host without Docker has nothing to report.
+    assert reporter.check_docker() == (None, None)
+    monkeypatch.setattr(reporter.shutil, "which", lambda name: "/usr/bin/docker")
+    # h200-ci-1 on 2026-10-16: the daemon answered, the bridge was gone.
+    assert reporter.check_docker() == (False, "the docker0 bridge is missing")
+    bridge.mkdir()
+    calls = []
+
+    def run(answer):
+        def fake_run(cmd, **kw):
+            assert kw["capture_output"] is True and kw["text"] is True
+            calls.append((cmd, kw["timeout"]))
+            if answer == "hang":
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            return subprocess.CompletedProcess(cmd, answer[0], "", answer[1])
+        monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+        return reporter.check_docker()
+
+    assert run((0, "")) == (True, None)
+    assert calls[0] == (["docker", "info", "--format", "{{.ServerVersion}}"], 10)
+    assert run("hang") == (False, "docker info did not answer in 10 s")
+    assert run((1, "warn\nCannot connect to the Docker daemon\n")) == (
+        False, "docker info failed: Cannot connect to the Docker daemon")
+    assert run((1, "")) == (False, "docker info failed: no output")
+    assert run((1, "x" * 400)) == (False, ("docker info failed: " + "x" * 400)[:300])
+
+
+def test_query_gpus_mig_utilization_is_null_not_zero(reporter, monkeypatch):
+    # MIG-enabled GPUs answer [N/A] for utilization; 0 would read as idle.
+    out = ("0, NVIDIA H200, [N/A], 58, 143771, 30, 76.85, 700.00\n"
+           "1, NVIDIA H200, 0, 58, 143771, 30, 76.85, 700.00\n")
+    monkeypatch.setattr(reporter.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
+    gpus = reporter.query_gpus()
+    assert [g["gpu_util"] for g in gpus] == [None, 0.0]
+
+
+DCGM_DISCOVERY_FIXTURE = """\
++-------------------+--------------------------------------------------------------------+
+| Instance Hierarchy                                                                     |
++===================+====================================================================+
+| GPU 0             | GPU GPU-5fb86225-82bd-0148-d092-f8c1dbec27bb (EntityID: 0)         |
+| -> I 0/3          | GPU Instance (EntityID: 0)                                         |
+|    -> CI 0/3/0    | Compute Instance (EntityID: 0)                                     |
+| -> I 0/4          | GPU Instance (EntityID: 1)                                         |
+|    -> CI 0/4/0    | Compute Instance (EntityID: 1)                                     |
++-------------------+--------------------------------------------------------------------+
+| GPU 1             | GPU GPU-266fe323-3792-a07d-1d36-64de604676bd (EntityID: 1)         |
+| -> I 1/3          | GPU Instance (EntityID: 21)                                        |
+|    -> CI 1/3/0    | Compute Instance (EntityID: 21)                                    |
+| -> I 1/4          | GPU Instance (EntityID: 22)                                        |
+|    -> CI 1/4/0    | Compute Instance (EntityID: 22)                                    |
++-------------------+--------------------------------------------------------------------+
+"""
+
+DCGM_DMON_FIXTURE = """\
+#Entity   GRACT        SMACT        SMOCC        TENSO        DRAMA
+ID
+GPU-I 0   N/A          N/A          N/A          N/A          N/A
+GPU-I 1   N/A          N/A          N/A          N/A          N/A
+GPU-I 21  N/A          N/A          N/A          N/A          N/A
+GPU-I 22  N/A          N/A          N/A          N/A          N/A
+GPU-I 0   1.000        0.900        0.100        0.000        0.200
+GPU-I 1   0.000        0.000        0.000        0.000        0.000
+GPU-I 21  0.400        0.300        0.100        0.000        0.100
+GPU-I 22  N/A          N/A          N/A          N/A          N/A
+GPU-I 0   0.800        0.700        0.100        0.000        0.200
+GPU-I 1   0.200        0.100        0.000        0.000        0.000
+GPU-I 21  0.600        0.500        0.100        0.000        0.100
+GPU-I 22  N/A          N/A          N/A          N/A          N/A
+"""
+
+
+def test_parse_dcgm_instances_maps_slices_to_gpus(reporter):
+    assert reporter.parse_dcgm_instances(DCGM_DISCOVERY_FIXTURE) == {
+        0: 0, 1: 0, 21: 1, 22: 1,
+    }
+
+
+def test_mig_util_averages_each_gpus_slices(reporter):
+    instances = reporter.parse_dcgm_instances(DCGM_DISCOVERY_FIXTURE)
+    # GPU 0: slices average 0.9 and 0.1 over the samples after warm-up, so
+    # the GPU is 50% busy. GPU 1: slice 22 never warmed up and is left out.
+    assert reporter.parse_mig_util(DCGM_DMON_FIXTURE, instances) == {
+        0: 50.0, 1: 50.0,
+    }
+
+
+def test_mig_util_omits_gpus_with_no_readable_slice(reporter):
+    instances = {0: 0, 21: 1}
+    text = "GPU-I 0   0.250  0 0 0 0\nGPU-I 21  N/A  N/A N/A N/A N/A\n"
+    assert reporter.parse_mig_util(text, instances) == {0: 25.0}
+
+
+def test_main_fills_mig_utilization_from_dcgm(reporter, monkeypatch):
+    gpus = [{"index": 0, "gpu_util": None}, {"index": 1, "gpu_util": 30.0},
+            {"index": 2, "gpu_util": None}]
+    monkeypatch.setattr(reporter, "query_mig_util", lambda: {0: 12.5, 1: 99.0})
+    reporter.fill_mig_util(gpus)
+    # Only unreadable GPUs are filled; one DCGM has no reading for stays null.
+    assert [g["gpu_util"] for g in gpus] == [12.5, 30.0, None]
+
+
+def test_fill_mig_util_skips_dcgm_when_every_gpu_reported(reporter, monkeypatch):
+    def boom():
+        raise AssertionError("DCGM queried on a non-MIG host")
+    monkeypatch.setattr(reporter, "query_mig_util", boom)
+    reporter.fill_mig_util([{"index": 0, "gpu_util": 5.0}])
+
+
+def test_fill_mig_util_leaves_null_when_dcgm_fails(reporter, monkeypatch):
+    def fail():
+        raise RuntimeError("dcgmi not found")
+    monkeypatch.setattr(reporter, "query_mig_util", fail)
+    gpus = [{"index": 0, "gpu_util": None}]
+    reporter.fill_mig_util(gpus)
+    assert gpus[0]["gpu_util"] is None
+
+
+def test_mig_util_skips_short_and_partial_rows(reporter):
+    text = ("GPU-I 0   0.12345 0 0 0 0\n"
+            "GPU-I 0   0.5\n"                     # truncated row still counts
+            "GPU-I 0\n"                           # no value: skipped
+            "GPU-I 0   N/A    0.900 0 0 0\n"      # GRACT unread: skipped
+            "GPU 0     0.900  0 0 0 0\n")         # whole-GPU row: ignored
+    assert reporter.parse_mig_util(text, {0: 0}) == {0: 31.17}
+
+
+def test_query_mig_util_runs_discovery_then_dmon_on_the_slices(reporter, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        assert kw["capture_output"] and kw["text"]
+        assert 0 < kw["timeout"] <= reporter.DCGM_BUDGET
+        out = DCGM_DISCOVERY_FIXTURE if cmd[1] == "discovery" else DCGM_DMON_FIXTURE
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+    assert reporter.query_mig_util() == {0: 50.0, 1: 50.0}
+    assert calls == [
+        ["dcgmi", "discovery", "-c"],
+        ["dcgmi", "dmon", "-e", "1001,1002,1003,1004,1005",
+         "-c", "3", "-d", "1000", "-i", "i:0,i:1,i:21,i:22"],
+    ]
+
+
+def test_query_mig_util_without_slices_skips_dmon(reporter, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "| GPU 0 | GPU GPU-x (EntityID: 0) |\n", "")
+
+    monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+    assert reporter.query_mig_util() == {}
+    assert len(calls) == 1
+
+
+def test_query_mig_util_raises_when_dcgmi_fails(reporter, monkeypatch):
+    monkeypatch.setattr(reporter.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "host engine down"))
+    try:
+        reporter.query_mig_util()
+    except RuntimeError as e:
+        assert "dcgmi discovery failed: host engine down" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_fill_mig_util_fills_a_host_where_every_gpu_is_mig(reporter, monkeypatch, capsys):
+    monkeypatch.setattr(reporter, "query_mig_util", lambda: {0: 40.0, 1: 0.0})
+    gpus = [{"index": 0, "gpu_util": None}, {"index": 1, "gpu_util": None}]
+    reporter.fill_mig_util(gpus)
+    assert [g["gpu_util"] for g in gpus] == [40.0, 0.0]
+
+
+def test_fill_mig_util_logs_dcgm_failures(reporter, monkeypatch, capsys):
+    def fail():
+        raise RuntimeError("dcgmi not found")
+    monkeypatch.setattr(reporter, "query_mig_util", fail)
+    reporter.fill_mig_util([{"index": 0, "gpu_util": None}])
+    assert "DCGM MIG utilization query failed: dcgmi not found" in capsys.readouterr().err
+
+
+def test_query_mig_util_shares_one_deadline_across_dcgmi_calls(reporter, monkeypatch):
+    # discovery uses 15 s of the budget, so dmon gets only what is left.
+    clock = iter([100.0, 100.0, 115.0])
+    monkeypatch.setattr(reporter.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(reporter, "RUN_START", 100.0)
+    timeouts = []
+
+    def fake_run(cmd, **kw):
+        timeouts.append(kw["timeout"])
+        out = DCGM_DISCOVERY_FIXTURE if cmd[1] == "discovery" else DCGM_DMON_FIXTURE
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+    reporter.query_mig_util()
+    assert timeouts == [reporter.DCGM_BUDGET, reporter.DCGM_BUDGET - 15]
+
+
+def test_query_mig_util_stops_at_the_run_deadline(reporter, monkeypatch):
+    # 40 s into the run, only 10 s remain before DCGM must be done.
+    monkeypatch.setattr(reporter, "RUN_START", 0.0)
+    monkeypatch.setattr(reporter.time, "monotonic", lambda: 40.0)
+    timeouts = []
+
+    def fake_run(cmd, **kw):
+        timeouts.append(kw["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(reporter.subprocess, "run", fake_run)
+    reporter.query_mig_util()
+    assert timeouts == [reporter.DCGM_RUN_DEADLINE - 40.0]
+
+
+def test_query_mig_util_skips_dcgm_late_in_the_run(reporter, monkeypatch):
+    monkeypatch.setattr(reporter, "RUN_START", 0.0)
+    monkeypatch.setattr(reporter.time, "monotonic",
+                        lambda: reporter.DCGM_RUN_DEADLINE - reporter.DCGM_MIN_TIME + 0.1)
+    monkeypatch.setattr(reporter.subprocess, "run", lambda *a, **k: 1 / 0)
+    try:
+        reporter.query_mig_util()
+    except RuntimeError as e:
+        assert "no time left" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")

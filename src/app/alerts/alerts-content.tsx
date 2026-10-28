@@ -17,6 +17,7 @@ import {
   type InfraRetiredHost,
 } from "@/lib/alerts-infra";
 import {
+  isImageBuildAlert,
   viewMainCiJobAlerts,
   type MainCiJobAlert,
 } from "@/lib/alerts-main-ci";
@@ -42,7 +43,7 @@ async function fetcher<T>(url: string): Promise<T> {
   return payload;
 }
 
-type AlertTab = "main-ci" | "fast-ci" | "infra" | "eval";
+type AlertTab = "main-ci" | "image-builds" | "fast-ci" | "infra" | "eval";
 
 const ALERT_TABS: readonly {
   value: AlertTab;
@@ -54,7 +55,13 @@ const ALERT_TABS: readonly {
     value: "main-ci",
     label: "Failures",
     description:
-      "Hard command-job failures on the main branch. A failure stays open across builds until that exact Buildkite step positively passes again; soft failures, missing jobs, and older builds finishing late do not resolve it. Resolving an alert by hand closes it without waiting for a pass.",
+      "Hard command-job failures on the main branch, except the image builds, which have their own tab. A failure stays open across builds until that exact Buildkite step positively passes again; soft failures, missing jobs, and older builds finishing late do not resolve it. Resolving an alert by hand closes it without waiting for a pass.",
+  },
+  {
+    value: "image-builds",
+    label: "Image builds",
+    description:
+      "Failures of the CUDA, CPU and arm64 image builds on the main branch, which every job that uses the image waits on. They follow the same lifecycle as Failures. When one is red on two main builds in a row, the alert channel gets a post, and another when it passes again.",
   },
   {
     value: "fast-ci",
@@ -159,6 +166,7 @@ interface InfraAlertsResponse {
   episodes?: InfraAlertEpisode[];
   retiredHosts?: InfraRetiredHost[];
   schemaStatus?: "ready" | "pending";
+  resolutionEnabled?: boolean;
   error?: string;
 }
 
@@ -298,12 +306,46 @@ function useAlertOperatorToken(): string {
   return useSyncExternalStore(subscribeOperatorToken, readOperatorToken, () => "");
 }
 
+function OperatorAccess() {
+  const operatorToken = useAlertOperatorToken();
+  const [showAccess, setShowAccess] = useState(false);
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setShowAccess((open) => !open)}
+        aria-expanded={showAccess}
+        className="dashboard-control text-xs font-medium text-zinc-600 hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100"
+      >
+        {operatorToken
+          ? "Operator access enabled for this tab"
+          : "Unlock resolve actions"}
+      </button>
+      {showAccess && (
+        <label className="mt-2 flex max-w-md flex-col gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 sm:flex-row sm:items-center">
+          <span className="shrink-0">Operator token</span>
+          <input
+            type="password"
+            value={operatorToken}
+            onChange={(event) => saveOperatorToken(event.target.value)}
+            autoComplete="off"
+            className="min-h-10 min-w-0 flex-1 rounded-md border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 shadow-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/15 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+          />
+        </label>
+      )}
+    </div>
+  );
+}
+
 function MainCISection({
   timeWindow,
   options,
+  imageBuilds,
 }: {
   timeWindow: AlertTimeWindow;
   options: AlertOptions;
+  /** The Image builds tab, or Failures with the image builds left out. */
+  imageBuilds: boolean;
 }) {
   const { data, isLoading, error, mutate } = useSWR<MainCIAlertsResponse>(
     "/api/alerts/main-ci",
@@ -311,15 +353,16 @@ function MainCISection({
     { refreshInterval: 5 * 60 * 1000 },
   );
   const operatorToken = useAlertOperatorToken();
-  const [showAccess, setShowAccess] = useState(false);
 
   const alerts = useMemo(
     () =>
       viewMainCiJobAlerts(
-        data?.alerts ?? [],
+        (data?.alerts ?? []).filter(
+          (alert) => isImageBuildAlert(alert) === imageBuilds,
+        ),
         alertWindowCutoff(timeWindow),
       ),
-    [data, timeWindow],
+    [data, timeWindow, imageBuilds],
   );
 
   const resolveAlert = async (alertId: string) => {
@@ -341,7 +384,7 @@ function MainCISection({
 
   return (
     <AlertSection
-      title="Failures"
+      title={imageBuilds ? "Image builds" : "Failures"}
       isLoading={isLoading}
       failed={Boolean(error || data?.error)}
       onRetry={() => void mutate()}
@@ -353,32 +396,7 @@ function MainCISection({
         </div>
       ) : (
         <div className="space-y-3">
-          {data?.resolutionEnabled && (
-            <div>
-              <button
-                type="button"
-                onClick={() => setShowAccess((open) => !open)}
-                aria-expanded={showAccess}
-                className="dashboard-control text-xs font-medium text-zinc-600 hover:text-zinc-950 dark:text-zinc-400 dark:hover:text-zinc-100"
-              >
-                {operatorToken
-                  ? "Operator access enabled for this tab"
-                  : "Unlock resolve actions"}
-              </button>
-              {showAccess && (
-                <label className="mt-2 flex max-w-md flex-col gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 sm:flex-row sm:items-center">
-                  <span className="shrink-0">Operator token</span>
-                  <input
-                    type="password"
-                    value={operatorToken}
-                    onChange={(event) => saveOperatorToken(event.target.value)}
-                    autoComplete="off"
-                    className="min-h-10 min-w-0 flex-1 rounded-md border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 shadow-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-500/15 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                  />
-                </label>
-              )}
-            </div>
-          )}
+          {data?.resolutionEnabled && <OperatorAccess />}
           <MainCIAlerts
             alerts={alerts}
             onResolve={operatorToken ? resolveAlert : undefined}
@@ -444,6 +462,34 @@ function InfraSection({ timeWindow }: { timeWindow: AlertTimeWindow }) {
       ),
     [data, timeWindow],
   );
+  const operatorToken = useAlertOperatorToken();
+
+  // Only the operator token holders resolve a quarantine; the actuator then
+  // returns the host and the worker marks it resolved.
+  const resolveQuarantine = async (
+    host: string,
+    by: string,
+    reason: string,
+    force: boolean,
+  ) => {
+    const response = await fetch(
+      `/api/alerts/quarantine/${encodeURIComponent(host)}/resolve`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${operatorToken}`,
+        },
+        body: JSON.stringify({ by, reason, force }),
+      },
+    );
+    if (!response.ok) {
+      if (response.status === 401) saveOperatorToken("");
+      const body = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(body?.error ?? `Resolve failed with ${response.status}`);
+    }
+    await mutate();
+  };
 
   return (
     <AlertSection
@@ -458,7 +504,13 @@ function InfraSection({ timeWindow }: { timeWindow: AlertTimeWindow }) {
           must be deployed before this preview can show alerts.
         </div>
       ) : (
-        <InfraAlerts view={view} />
+        <div className="space-y-3">
+          {data?.resolutionEnabled && <OperatorAccess />}
+          <InfraAlerts
+            view={view}
+            onResolveQuarantine={operatorToken ? resolveQuarantine : undefined}
+          />
+        </div>
       )}
     </AlertSection>
   );
@@ -613,8 +665,12 @@ export default function AlertsContent() {
         </div>
       </div>
 
-      {tab === "main-ci" ? (
-        <MainCISection timeWindow={timeWindow} options={options} />
+      {tab === "main-ci" || tab === "image-builds" ? (
+        <MainCISection
+          timeWindow={timeWindow}
+          options={options}
+          imageBuilds={tab === "image-builds"}
+        />
       ) : tab === "infra" ? (
         <InfraSection timeWindow={timeWindow} />
       ) : tab === "eval" ? (

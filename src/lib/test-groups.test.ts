@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  aggregateJobsByGroup,
+  foldRuntimeShards,
   getTestGroup,
   groupParametrizedTests,
   matchesTestQuery,
@@ -16,6 +18,7 @@ import {
   discoverGroupYamlPaths,
   isOptionalJob,
   isSoftFailJob,
+  parseBuildkiteYaml,
   parseTestStep,
 } from "./test-areas";
 
@@ -363,4 +366,73 @@ test("summarizeGroupJobs derives group state from the given jobs", () => {
     summarizeGroupJobs("Models", [{ name: "d", state: "blocked" }]).state,
     "blocked",
   );
+});
+
+test("parseBuildkiteYaml keeps the last value of a duplicated key like PyYAML", () => {
+  const parsed = parseBuildkiteYaml(
+    "group: Attention\nsteps:\n- label: A\n  commands:\n  - first\n  commands:\n  - second\n",
+  ) as { steps: { commands: string[] }[] };
+  assert.deepEqual(parsed.steps[0].commands, ["second"]);
+});
+
+test("foldRuntimeShards rolls a step's shards into one job", () => {
+  const folded = foldRuntimeShards([
+    { name: "Basic Correctness", state: "passed" },
+    { name: "Quantization Shard 2/3", state: "failed", web_url: "u2" },
+    { name: "Quantization Shard 1/3", state: "passed", web_url: "u1" },
+    { name: "Quantization Shard 3/3", state: "running", web_url: "u3" },
+    { name: "Language Models Test 3", state: "passed" },
+  ]);
+  assert.deepEqual(folded, [
+    { name: "Basic Correctness", state: "passed" },
+    {
+      name: "Quantization",
+      state: "failed",
+      web_url: "u2",
+      shards: [
+        { index: 1, total: 3, state: "passed", web_url: "u1" },
+        { index: 2, total: 3, state: "failed", web_url: "u2" },
+        { index: 3, total: 3, state: "running", web_url: "u3" },
+      ],
+    },
+    { name: "Language Models Test 3", state: "passed" },
+  ]);
+});
+
+test("foldRuntimeShards: running beats passed, all-passed passes", () => {
+  const stepOf = (jobs: { name: string; state: string; web_url: string }[]) => {
+    const [{ name, state, web_url }] = foldRuntimeShards(jobs);
+    return { name, state, web_url };
+  };
+  assert.deepEqual(
+    stepOf([
+      { name: "Q shard 1/2", state: "passed", web_url: "u1" },
+      { name: "Q shard 2/2", state: "scheduled", web_url: "u2" },
+    ]),
+    { name: "Q", state: "scheduled", web_url: "u1" },
+  );
+  assert.deepEqual(
+    stepOf([
+      { name: "Q Shard 2/2", state: "passed", web_url: "u2" },
+      { name: "Q Shard 1/2", state: "passed", web_url: "u1" },
+    ]),
+    { name: "Q", state: "passed", web_url: "u1" },
+  );
+});
+
+test("aggregateJobsByGroup keeps sharded steps in their group", () => {
+  const mapping = buildTestAreaMapping([
+    { group: "Quantization", steps: [{ label: "Quantization Test" }] },
+  ]);
+  const [group] = aggregateJobsByGroup(
+    [
+      { name: "Quantization Test Shard 1/2", state: "passed" },
+      { name: "Quantization Test Shard 2/2", state: "failed" },
+    ],
+    mapping,
+  );
+  assert.equal(group.group, "Quantization");
+  assert.equal(group.total, 1);
+  assert.equal(group.state, "failed");
+  assert.deepEqual(group.jobs.map((job) => job.name), ["Quantization Test"]);
 });

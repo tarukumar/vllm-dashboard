@@ -12,7 +12,11 @@ import {
 import useSWR from "swr";
 import { BuildWaterfall } from "@/components/build-waterfall";
 import { JobName, jobNameText, splitJobName } from "@/components/job-name";
-import { summarizeGroupJobs, type GroupStatus } from "@/lib/test-groups";
+import {
+  summarizeGroupJobs,
+  type GroupStatus,
+  type JobInfo,
+} from "@/lib/test-groups";
 import {
   buildDurationDisplay,
   isBuildInProgress,
@@ -125,6 +129,7 @@ function DotWithTooltip({
   onClick,
   highlight,
   onHover,
+  shardColors,
 }: {
   color: string;
   ariaLabel: string;
@@ -134,6 +139,8 @@ function DotWithTooltip({
   onClick?: () => void;
   highlight?: boolean;
   onHover?: (hovering: boolean) => void;
+  /** One color per runtime shard, drawn as a strip under the step's dot. */
+  shardColors?: string[];
 }) {
   // Viewport coordinates of the dot, so the popup can be position:fixed and
   // escape the table's overflow-x-auto clipping.
@@ -151,7 +158,19 @@ function DotWithTooltip({
     anchor !== null &&
     typeof window !== "undefined" &&
     anchor.x > window.innerWidth * 0.7;
-  const dot = <span className={`block h-3.5 w-3.5 rounded-sm ${color}`} />;
+  const dot = (
+    <span className={`relative block h-3.5 w-3.5 rounded-sm ${color}`}>
+      {shardColors && (
+        <span
+          className={`absolute inset-x-0 -bottom-[5px] flex h-[3px] ${shardColors.length <= 6 ? "gap-px" : ""}`}
+        >
+          {shardColors.map((shardColor, index) => (
+            <span key={index} className={`h-full flex-1 rounded-[1px] ${shardColor}`} />
+          ))}
+        </span>
+      )}
+    </span>
+  );
   const cls = "inline-flex h-5 w-5 items-center justify-center";
   return (
     <td
@@ -272,15 +291,12 @@ interface Column {
 }
 
 interface BuildJobsResponse {
-  jobsByBuild: Record<
-    string,
-    Record<string, Array<{ name: string; state: string; web_url?: string }>>
-  >;
+  jobsByBuild: Record<string, Record<string, JobInfo[]>>;
 }
 
 type CompactJobsByBuild = Record<
   string,
-  Record<string, Array<[nameIndex: number, state: string]>>
+  Record<string, Array<[nameIndex: number, state: string, shardStates?: string[]]>>
 >;
 
 interface BuildsTableProps {
@@ -482,7 +498,7 @@ export function BuildsTable({
   const hasGroups = groupOrder.length > 0;
   const showSkeleton = !hasGroups && Boolean(groupsLoading) && builds.length > 0;
   const skeletonCount = showSkeleton ? SKELETON_GROUP_COLUMNS : 0;
-  const FIXED_COLS = showBranch ? 8 : 7;
+  const FIXED_COLS = 1;
 
   // Size the header row for the widest rotated label so long group and job
   // names are not clipped at the top of the table.
@@ -517,14 +533,9 @@ export function BuildsTable({
         <table className="text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
           <thead>
             <tr className="border-b border-zinc-200 dark:border-zinc-800">
-              <th className="sticky left-0 z-10 bg-white px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:bg-zinc-950 dark:text-zinc-400">Build</th>
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Commit</th>
-              {showBranch && <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Branch</th>}
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">PR</th>
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Author</th>
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Status</th>
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Duration</th>
-              <th className="px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:text-zinc-400">Message</th>
+              <th className="sticky left-0 z-10 border-r border-zinc-200 bg-white px-4 pb-2 text-left align-bottom font-semibold text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400">
+                Build
+              </th>
               {hasGroups &&
                 columns.map((col, i) => {
                   const key = col.type === "job" ? `${col.group}::${col.jobName}` : col.group;
@@ -624,16 +635,28 @@ export function BuildsTable({
                 const urlsByName = new Map(
                   details.map((job) => [job.name, job.web_url]),
                 );
+                const shardUrlsByName = new Map(
+                  details.map((job) => [
+                    job.name,
+                    job.shards?.map((shard) => shard.web_url),
+                  ]),
+                );
                 const failedUrlsByName = new Map(
                   (g.failedJobs ?? []).map((job) => [job.name, job.web_url]),
                 );
                 const jobs = (jobsByBuild[build.id]?.[g.group] ?? [])
-                  .map(([nameIndex, state]) => ({
+                  .map(([nameIndex, state, shardStates]) => ({
                     name: jobNames[nameIndex],
                     state,
                     web_url:
                       urlsByName.get(jobNames[nameIndex]) ??
                       failedUrlsByName.get(jobNames[nameIndex]),
+                    shards: shardStates?.map((shardState, index) => ({
+                      index: index + 1,
+                      total: shardStates.length,
+                      state: shardState,
+                      web_url: shardUrlsByName.get(jobNames[nameIndex])?.[index],
+                    })),
                   }))
                   .filter((job) => Boolean(job.name));
                 const visibleJobs = isFilteringJobs
@@ -669,7 +692,7 @@ export function BuildsTable({
                     } ${isTraceExpanded ? "" : "hover:bg-blue-50 dark:hover:bg-blue-950/40"}`}
                   >
                     <td
-                      className={`sticky left-0 z-10 whitespace-nowrap px-4 py-2 ${
+                      className={`sticky left-0 z-10 w-[26rem] min-w-[26rem] max-w-[26rem] border-r border-zinc-200 px-3 py-1.5 dark:border-zinc-800 ${
                         isTraceExpanded
                           ? "bg-zinc-50 dark:bg-zinc-900"
                           : "bg-white group-hover:bg-blue-50 dark:bg-zinc-950 dark:group-hover:bg-blue-950"
@@ -679,6 +702,7 @@ export function BuildsTable({
                         {canShowTrace ? (
                           <button
                             type="button"
+                            title={isTraceExpanded ? "Hide timeline" : "View timeline"}
                             aria-label={`${isTraceExpanded ? "Hide" : "Show"} timeline for build ${build.build_number}`}
                             aria-expanded={isTraceExpanded}
                             aria-controls={`build-trace-${build.id}`}
@@ -687,10 +711,10 @@ export function BuildsTable({
                                 current === build.id ? null : build.id,
                               )
                             }
-                            className={`dashboard-control inline-flex min-h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors ${
+                            className={`dashboard-control inline-flex h-8 shrink-0 items-center gap-0.5 rounded-md border px-1.5 transition-colors ${
                               isTraceExpanded
                                 ? "border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-800 dark:bg-blue-950/60 dark:text-blue-300"
-                                : "border-zinc-300 bg-white text-zinc-700 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:border-blue-800 dark:hover:bg-blue-950/50 dark:hover:text-blue-300"
+                                : "border-zinc-300 bg-white text-zinc-600 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:border-blue-800 dark:hover:bg-blue-950/50 dark:hover:text-blue-300"
                             }`}
                           >
                             <svg
@@ -703,13 +727,10 @@ export function BuildsTable({
                                 fill="currentColor"
                               />
                             </svg>
-                            <span>
-                              {isTraceExpanded ? "Hide timeline" : "View timeline"}
-                            </span>
                             <svg
                               viewBox="0 0 16 16"
                               aria-hidden="true"
-                              className={`h-3.5 w-3.5 transition-transform motion-reduce:transition-none ${isTraceExpanded ? "rotate-90" : ""}`}
+                              className={`h-3 w-3 transition-transform motion-reduce:transition-none ${isTraceExpanded ? "rotate-90" : ""}`}
                             >
                               <path
                                 d="m6 3.5 4.5 4.5L6 12.5"
@@ -723,94 +744,108 @@ export function BuildsTable({
                           </button>
                         ) : (
                           <span
-                            className="inline-flex min-h-8 items-center rounded-md border border-zinc-200 px-2.5 text-xs text-zinc-400 dark:border-zinc-800 dark:text-zinc-600"
+                            className="inline-flex h-8 w-[2.625rem] shrink-0 items-center justify-center rounded-md border border-zinc-200 text-xs text-zinc-300 dark:border-zinc-800 dark:text-zinc-700"
                             title="Timeline unavailable"
                           >
-                            No timeline
+                            —
                           </span>
                         )}
-                        <span className="text-zinc-500 dark:text-zinc-400">
-                          {build.created_at ? formatTime(build.created_at) : "—"}
-                        </span>
-                        {build.web_url && build.build_number ? (
-                          <a
-                            href={build.web_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            aria-label={`Open Buildkite build ${build.build_number}`}
-                            className="inline-flex items-center gap-1 font-medium text-blue-600 hover:underline dark:text-blue-400"
-                          >
-                            Buildkite #{build.build_number}
-                            <span aria-hidden="true">↗</span>
-                          </a>
-                        ) : null}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            {build.web_url ? (
+                              <a
+                                href={build.web_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className={`shrink-0 rounded-full px-2 py-px text-[11px] font-medium leading-4 underline decoration-current/30 hover:decoration-current ${stateColor(build.state)}`}
+                              >
+                                {build.state}
+                              </a>
+                            ) : (
+                              <span
+                                className={`shrink-0 rounded-full px-2 py-px text-[11px] font-medium leading-4 ${stateColor(build.state)}`}
+                              >
+                                {build.state}
+                              </span>
+                            )}
+                            {build.web_url && build.build_number ? (
+                              <a
+                                href={build.web_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                aria-label={`Open Buildkite build ${build.build_number}`}
+                                className="shrink-0 font-medium tabular-nums text-blue-600 hover:underline dark:text-blue-400"
+                              >
+                                #{build.build_number}
+                                <span aria-hidden="true"> ↗</span>
+                              </a>
+                            ) : null}
+                            <span
+                              className="min-w-0 truncate text-zinc-700 dark:text-zinc-300"
+                              title={build.message ?? undefined}
+                            >
+                              {build.message ?? "—"}
+                            </span>
+                          </div>
+                          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-xs text-zinc-500 dark:text-zinc-400">
+                            <span className="shrink-0">
+                              {build.created_at ? formatTime(build.created_at) : "—"}
+                            </span>
+                            {build.author && (
+                              <>
+                                <span aria-hidden="true" className="text-zinc-300 dark:text-zinc-700">·</span>
+                                <span className="min-w-0 truncate" title={build.author}>
+                                  {build.author}
+                                </span>
+                              </>
+                            )}
+                            {showBranch && build.branch && (
+                              <>
+                                <span aria-hidden="true" className="text-zinc-300 dark:text-zinc-700">·</span>
+                                <span className="min-w-0 truncate" title={build.branch}>
+                                  {build.branch}
+                                </span>
+                              </>
+                            )}
+                            {build.commit_sha && (
+                              <>
+                                <span aria-hidden="true" className="text-zinc-300 dark:text-zinc-700">·</span>
+                                <a
+                                  href={`https://github.com/vllm-project/vllm/commit/${build.commit_sha}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="Commit"
+                                  className="shrink-0 font-mono text-blue-600 hover:underline dark:text-blue-400"
+                                >
+                                  {build.commit_sha.slice(0, 7)}
+                                </a>
+                              </>
+                            )}
+                            {build.pr_number && (
+                              <>
+                                <span aria-hidden="true" className="text-zinc-300 dark:text-zinc-700">·</span>
+                                <a
+                                  href={`https://github.com/vllm-project/vllm/pull/${build.pr_number}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="Pull request"
+                                  className="shrink-0 text-blue-600 hover:underline dark:text-blue-400"
+                                >
+                                  PR #{build.pr_number}
+                                </a>
+                              </>
+                            )}
+                            <span aria-hidden="true" className="text-zinc-300 dark:text-zinc-700">·</span>
+                            <span
+                              className={`shrink-0 tabular-nums ${durationColor(duration.kind)}`}
+                              title={duration.title}
+                            >
+                              {duration.label}
+                            </span>
+                          </div>
+                        </div>
                       </div>
                     </td>
-                  <td className="px-4 py-2 font-mono text-xs">
-                    {build.commit_sha ? (
-                      <a
-                        href={`https://github.com/vllm-project/vllm/commit/${build.commit_sha}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline dark:text-blue-400"
-                      >
-                        {build.commit_sha.slice(0, 7)}
-                      </a>
-                    ) : (
-                      <span className="text-zinc-500">—</span>
-                    )}
-                  </td>
-                  {showBranch && (
-                    <td className="px-4 py-2 text-zinc-600 dark:text-zinc-400">
-                      {build.branch}
-                    </td>
-                  )}
-                  <td className="px-4 py-2 text-xs">
-                    {build.pr_number ? (
-                      <a
-                        href={`https://github.com/vllm-project/vllm/pull/${build.pr_number}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline dark:text-blue-400"
-                      >
-                        #{build.pr_number}
-                      </a>
-                    ) : (
-                      <span className="text-zinc-400">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2 text-zinc-600 dark:text-zinc-400">
-                    {build.author ?? "—"}
-                  </td>
-                  <td className="px-4 py-2">
-                    {build.web_url ? (
-                      <a
-                        href={build.web_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium underline decoration-current/30 hover:decoration-current ${stateColor(build.state)}`}
-                      >
-                        {build.state}
-                      </a>
-                    ) : (
-                      <span
-                        className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${stateColor(build.state)}`}
-                      >
-                        {build.state}
-                      </span>
-                    )}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-2 text-xs tabular-nums">
-                    <span
-                      className={durationColor(duration.kind)}
-                      title={duration.title}
-                    >
-                      {duration.label}
-                    </span>
-                  </td>
-                  <td className="max-w-[16rem] truncate px-4 py-2 text-zinc-600 dark:text-zinc-400">
-                    {build.message ?? "—"}
-                  </td>
                     {columns.map((col, i) => {
                     const key =
                       col.type === "job"
@@ -919,7 +954,25 @@ export function BuildsTable({
                             <p className="text-zinc-500 dark:text-zinc-400">{col.group}</p>
                             <p className={`capitalize ${stateTextColor(job.state)}`}>
                               {job.state.replace(/_/g, " ")}
+                              {job.shards && (
+                                <span className="normal-case text-zinc-500 dark:text-zinc-400">
+                                  {` · ${job.shards.filter((shard) => shard.state === "passed").length}/${job.shards.length} shards passed`}
+                                </span>
+                              )}
                             </p>
+                            {job.shards && (
+                              <ul className="mt-1 space-y-0.5">
+                                {job.shards.map((shard) => (
+                                  <li key={shard.index} className="flex items-center gap-1.5">
+                                    <span className={`block h-2 w-2 rounded-sm ${dotColor(shard.state)}`} />
+                                    <span>Shard {shard.index}/{shard.total}</span>
+                                    <span className={stateTextColor(shard.state)}>
+                                      {shard.state.replace(/_/g, " ")}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
                             <BuildContext build={build} />
                             {job.web_url && (
                               <p className="mt-1 text-zinc-400 dark:text-zinc-500">Click to open in Buildkite ↗</p>
@@ -930,6 +983,7 @@ export function BuildsTable({
                         highlight={hoveredCol === key}
                         onHover={onHover}
                         borderClass={borderR}
+                        shardColors={job.shards?.map((shard) => dotColor(shard.state))}
                       />
                     );
                     })}

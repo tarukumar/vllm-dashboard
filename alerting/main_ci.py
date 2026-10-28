@@ -9,13 +9,22 @@ cannot overwrite a newer outcome.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from alerting.commands import ScheduledCommand
-from alerting.ports import Clock
+from alerting.fast_ci import _slack_code, _slack_link, _split_job_emoji, slack_channel
+from alerting.ports import (
+    AlertPath,
+    Clock,
+    DeliveryMode,
+    DestinationMode,
+    NotificationIntent,
+)
 from alerting.runtime import HandlerCompletion
+from alerting.slack import header_block, section_blocks
 
 INITIAL_LOOKBACK = timedelta(days=1)
 SAFETY_OVERLAP = timedelta(minutes=30)
@@ -25,6 +34,17 @@ SAFETY_OVERLAP = timedelta(minutes=30)
 SWEEP_LOOKBACK = timedelta(hours=48)
 FAILURE_STATES = frozenset({"failed", "failing", "broken", "timed_out"})
 TRACKED_STATES = FAILURE_STATES | {"passed"}
+# Runtime-sharded steps (`automatic_shard: true`) run as parallel jobs named
+# "<step> shard N/M", and the pipeline generator re-plans which tests each
+# shard runs on every build. A shard is not a stable job, so its step is.
+RUNTIME_SHARD = re.compile(r" shard (\d+)/(\d+)$")
+# Image builds the other jobs wait on. When one is red on two main builds with
+# no pass between (a retry in the same build is still one build), the Fast CI
+# channel gets one post, and one more when it passes again. One red build
+# alone may be a registry or network blip, so it stays dashboard-only.
+# The dashboard lists these in their own Alerts tab: keep in sync with
+# IMAGE_BUILD_STEPS in src/lib/alerts-main-ci.ts.
+IMAGE_BUILD_STEPS = frozenset({"image-build", "image-build-cpu", "arm64-image-build"})
 
 
 @dataclass(frozen=True)
@@ -92,6 +112,70 @@ class MainCIJobAlert:
         return "resolved" if self.resolved_at is not None else "open"
 
 
+def image_build_notice(
+    *,
+    alert_id: int,
+    job_key: str,
+    job_name: str,
+    first_failure_build_number: int,
+    first_failure_build_url: str,
+    last_failure_build_number: int,
+    observation: MainCIJobObservation,
+    delivery_mode: DeliveryMode,
+) -> NotificationIntent | None:
+    """The Slack post an image-build episode owes once `observation` applied.
+
+    Called with the episode as it stands after a failure, or as it stood
+    before the pass that resolves it. The delivery id is per episode and
+    kind, so refreshing failures enqueue nothing new.
+    """
+    step = job_key.removeprefix("step:").split("|", 1)[0]
+    if (
+        not job_key.startswith("step:")
+        or step not in IMAGE_BUILD_STEPS
+        or first_failure_build_number == last_failure_build_number
+    ):
+        return None
+    # Laid out like a Fast CI job line: emoji outside the linked job name,
+    # then the builds and the commit.
+    emoji, bare_name = _split_job_emoji(job_name)
+    job = _slack_link(observation.job_url, bare_name)
+    if emoji:
+        job = f"{emoji} {job}"
+    build = _slack_link(observation.build_url, f"CI #{observation.build_number}")
+    commit = f"commit {_slack_code(observation.commit_sha[:8])}"
+    if observation.failed:
+        kind = "failing"
+        heading = "🐳 MAIN CI · Image build failing"
+        first = _slack_link(
+            first_failure_build_url, f"CI #{first_failure_build_number}"
+        )
+        body = (
+            f":red_circle: {job} — red since {first}, no pass since"
+            f" · latest {build} · {commit}\n"
+            "Jobs that use this image cannot run until it is fixed."
+        )
+    else:
+        kind = "green"
+        heading = "✅ MAIN CI · Image build green again"
+        body = f":white_check_mark: {job} — passed in {build} · {commit}"
+    delivery_id = f"main-ci:image-build:{alert_id}:{kind}"
+    return NotificationIntent(
+        delivery_id=delivery_id,
+        alert_ref=delivery_id,
+        alert_path=AlertPath.MAIN_CI,
+        delivery_mode=delivery_mode,
+        destination_mode=DestinationMode.BOT_TOKEN,
+        destination=slack_channel(),
+        # The header block tells this post apart in the shared alert channel;
+        # `text` is the notification and fallback copy.
+        payload={
+            "text": f"{heading}: {body}",
+            "blocks": [header_block(heading), *section_blocks(body)],
+        },
+    )
+
+
 def ordered_unique_observations(
     observations: list[MainCIJobObservation],
 ) -> list[MainCIJobObservation]:
@@ -116,6 +200,26 @@ def _parse_datetime(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("Buildkite finished_at must be timezone-aware")
     return parsed
+
+
+def _parallel_shard(job: dict[str, Any], name: str) -> tuple[str, int] | None:
+    """Return (step name, shard total) for a Buildkite parallel job.
+
+    Parallel steps render their index into the label in several forms
+    ("X Shard 2", "X Shard 2/3", "X 2", "X Shard 2 (queue)"), and the form and
+    total change as steps move between fixed and automatic sharding. Dropping
+    the rendered index keeps one alert per step across those relabels.
+    """
+    total = job.get("parallel_group_total")
+    index = job.get("parallel_group_index")
+    if not isinstance(total, int) or total < 2 or not isinstance(index, int):
+        return None
+    rendered = re.compile(rf"(?i)(?:\s+shard)?\s+{index + 1}(?:/\d+)?(?!\d)")
+    matches = list(rendered.finditer(name))
+    if not matches:
+        return name, total
+    last = matches[-1]
+    return name[: last.start()] + name[last.end() :], total
 
 
 def build_job_observations(build: dict[str, Any]) -> list[MainCIJobObservation]:
@@ -147,6 +251,8 @@ def build_job_observations(build: dict[str, Any]) -> list[MainCIJobObservation]:
             name_to_step_key[name] = step_key
     build_id = str(build["id"])
     build_number = int(build["number"])
+    shard_totals: dict[str, int] = {}
+    names: dict[str, str] = {}
     build_url = str(build.get("web_url") or "")
     commit_sha = str(build.get("commit") or "")
     observations: list[MainCIJobObservation] = []
@@ -169,14 +275,27 @@ def build_job_observations(build: dict[str, Any]) -> list[MainCIJobObservation]:
         step_key = str(job.get("step_key") or "").strip() or name_to_step_key.get(
             name, ""
         )
+        parallel = _parallel_shard(job, name)
+        shard = None if parallel else RUNTIME_SHARD.search(name)
+        if parallel:
+            step_name, total = parallel
+        elif shard:
+            step_name, total = name[: shard.start()], int(shard.group(2))
+        else:
+            step_name, total = name, 0
         # Matrix expansions share a configured step key. Include the
         # rendered job name so one matrix cell cannot resolve another.
-        job_key = f"step:{step_key}|name:{name}" if step_key else f"name:{name}"
+        job_key = (
+            f"step:{step_key}|name:{step_name}" if step_key else f"name:{step_name}"
+        )
+        if total:
+            shard_totals[job_key] = total
+            names[job_id] = name
         observations.append(
             MainCIJobObservation(
                 job_key=job_key,
                 job_id=job_id,
-                job_name=name,
+                job_name=step_name,
                 job_url=str(job.get("web_url") or f"{build_url}#{job_id}"),
                 state=state,
                 finished_at=finished_at,
@@ -186,7 +305,40 @@ def build_job_observations(build: dict[str, Any]) -> list[MainCIJobObservation]:
                 commit_sha=commit_sha,
             )
         )
-    return observations
+    return _fold_runtime_shards(observations, shard_totals, names)
+
+
+def _fold_runtime_shards(
+    observations: list[MainCIJobObservation],
+    shard_totals: dict[str, int],
+    names: dict[str, str],
+) -> list[MainCIJobObservation]:
+    """Report a sharded step's outcome in one build, never one shard's.
+
+    One shard passing says nothing about the tests another shard failed, so
+    a shard's pass may not resolve the step's alert. While the latest attempt
+    of any shard has failed, the step's passes are dropped; until every shard
+    has passed, the step has no outcome yet. Once all have, its failures and
+    passes stand as an unsharded job's do, so retried shards resolve.
+    """
+    folded: list[MainCIJobObservation] = []
+    by_key: dict[str, list[MainCIJobObservation]] = {}
+    for observation in observations:
+        if observation.job_key in shard_totals:
+            by_key.setdefault(observation.job_key, []).append(observation)
+        else:
+            folded.append(observation)
+    for job_key, executions in by_key.items():
+        latest: dict[str, MainCIJobObservation] = {}
+        for execution in executions:
+            shard = names[execution.job_id]
+            if shard not in latest or execution.order > latest[shard].order:
+                latest[shard] = execution
+        if any(execution.failed for execution in latest.values()):
+            folded.extend(execution for execution in executions if execution.failed)
+        elif len(latest) >= shard_totals[job_key]:
+            folded.extend(executions)
+    return folded
 
 
 class BuildkiteMainCISource:
@@ -256,8 +408,10 @@ class MainCIStore(Protocol):
         observations: list[MainCIJobObservation],
         scanned_through: datetime,
         now: datetime,
+        delivery_mode: DeliveryMode,
     ) -> None:
-        """Atomically reconcile outcomes, advance the cursor, and complete."""
+        """Atomically reconcile outcomes, enqueue image-build posts, advance
+        the cursor, and complete."""
         ...
 
 
@@ -309,10 +463,12 @@ class MainCIBackstopHandler:
         builds: MainCIBackstopBuildPort,
         store: MainCIBackstopStore,
         clock: Clock,
+        delivery_mode: DeliveryMode,
     ) -> None:
         self._builds = builds
         self._store = store
         self._clock = clock
+        self._delivery_mode = delivery_mode
 
     def __call__(self, command: ScheduledCommand) -> HandlerCompletion:
         sweep_builds = self._builds.list_job_builds(
@@ -335,9 +491,7 @@ class MainCIBackstopHandler:
                     ref.job_key
                 )
         for build_number in sorted(job_keys_by_build):
-            build = self._builds.get_build(
-                build_number, include_retried_jobs=True
-            )
+            build = self._builds.get_build(build_number, include_retried_jobs=True)
             candidates = build_job_observations(build)
             for job_key in job_keys_by_build[build_number]:
                 executions = [
@@ -346,9 +500,7 @@ class MainCIBackstopHandler:
                     if candidate.job_key == job_key
                 ]
                 if executions:
-                    observations.append(
-                        max(executions, key=lambda item: item.order)
-                    )
+                    observations.append(max(executions, key=lambda item: item.order))
         # The sweep only re-checks known state; it must not advance the
         # poller's scan cursor, or a poller outage covered by the sweep would
         # skip failures that fell into the gap.
@@ -358,6 +510,7 @@ class MainCIBackstopHandler:
             observations=observations,
             scanned_through=cursor if cursor is not None else command.target_time,
             now=self._clock.now(),
+            delivery_mode=self._delivery_mode,
         )
         return HandlerCompletion.TRANSACTIONAL
 
@@ -366,11 +519,17 @@ class MainCIReconciliationHandler:
     """Poll a cursor window and reconcile exact job alert lifecycles."""
 
     def __init__(
-        self, *, source: MainCISource, store: MainCIStore, clock: Clock
+        self,
+        *,
+        source: MainCISource,
+        store: MainCIStore,
+        clock: Clock,
+        delivery_mode: DeliveryMode,
     ) -> None:
         self._source = source
         self._store = store
         self._clock = clock
+        self._delivery_mode = delivery_mode
 
     def __call__(self, command: ScheduledCommand) -> HandlerCompletion:
         cursor = self._store.main_ci_scan_cursor()
@@ -389,5 +548,6 @@ class MainCIReconciliationHandler:
             observations=observations,
             scanned_through=command.target_time,
             now=self._clock.now(),
+            delivery_mode=self._delivery_mode,
         )
         return HandlerCompletion.TRANSACTIONAL

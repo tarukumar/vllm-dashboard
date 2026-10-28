@@ -111,10 +111,20 @@ class FakePostgresConnection:
             return Result(rows=list(self.state["thresholds"]))
         if statement.startswith("WITH gpu AS ("):
             return Result(rows=list(self.state["reports"]))
-        if statement.startswith("SELECT DISTINCT hostname FROM gpu_snapshots"):
+        if statement.startswith("SELECT DISTINCT hostname FROM gpu_history_5m"):
             return Result(rows=list(self.state["recent_hosts"]))
         if statement.startswith("WITH RECURSIVE latest AS ("):
             return Result(rows=list(self.state["mounts"]))
+        if statement.startswith(
+            (
+                "SELECT DISTINCT ON (hostname, gpu_index) hostname, gpu_index, "
+                "recovery_action",
+                "SELECT DISTINCT ON (hostname) hostname, gpu_query_hung",
+                "SELECT hostname, bus_id, xid, at FROM gpu_xid_events",
+                "SELECT DISTINCT hostname, queue FROM buildkite_agent_snapshots",
+            )
+        ):
+            return Result(rows=[])  # trigger-rule readings: none reported
         if statement.startswith("SELECT DISTINCT ON (hostname, gpu_index)"):
             return Result(rows=list(self.state["temps"]))
         if statement.startswith("SELECT hostname, count(DISTINCT gpu_index)"):
@@ -181,6 +191,20 @@ class FakePostgresConnection:
                     alert["status"] = "resolved"
                     alert["resolved_at"] = params[0]
                     alert["details"] = json.loads(params[1])
+                    return Result(rowcount=1)
+            return Result(rowcount=0)
+        if statement.startswith("UPDATE alerting_infra_alerts SET status = %s"):
+            assert self.transaction_depth == 1
+            for alert in self.state["infra_alerts"]:
+                if (
+                    alert["alert_type"] == params[4]
+                    and alert["subject_key"] == params[5]
+                    and alert["status"] == "open"
+                    and alert["details"].get("stage") == params[6]
+                ):
+                    alert["status"] = params[0]
+                    alert["resolved_at"] = params[1]
+                    alert["details"] = {**alert["details"], **json.loads(params[2])}
                     return Result(rowcount=1)
             return Result(rowcount=0)
         if statement.startswith("INSERT INTO alerting_notification_outbox"):
@@ -330,3 +354,84 @@ def test_postgres_disk_group_deduplicates_across_hosts_sharing_a_volume() -> Non
     text = json.loads(outbox_row[6])["text"]
     assert "h200-ci-1" in text and "h200-ci-2" in text
     assert "/scratch" not in text
+
+
+def test_postgres_stage_change_merges_its_patch_and_keeps_dashboard_fields() -> None:
+    connection = FakePostgresConnection()
+    connection.state["thresholds"] = []
+    connection.state["infra_alerts"].append(
+        {
+            "alert_id": 1,
+            "alert_type": "quarantine",
+            "subject_key": "h200-ci-2",
+            "status": "open",
+            "opened_at": START,
+            "details": {
+                "stage": "resolving",
+                "resolved_by": "oncall",
+                "actuator_state": "returned",
+            },
+            "resolved_at": None,
+        }
+    )
+    runtime, clock = runtime_for(connection, FixtureHosts(set()))
+
+    scan(runtime, clock.now())
+
+    [alert] = connection.state["infra_alerts"]
+    assert alert["status"] == "resolved"
+    assert alert["resolved_at"] == clock.now()
+    assert alert["details"] == {
+        "stage": "resolved",
+        "resolved_by": "oncall",
+        "actuator_state": "returned",
+    }
+    [row] = connection.state["outbox"].values()
+    assert str(row[0]).endswith(":resolved")
+
+
+def test_xid_query_reads_only_the_trigger_rule_xids() -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    class XidConnection(FakePostgresConnection):
+        def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Result:
+            seen.append(params)
+            return Result(rows=[("gpu-node-7", "", 79, START)])
+
+    store = PostgresAlertStore(lambda: XidConnection())
+    events = store.xid_events(hostnames=["gpu-node-7"], since=START)
+
+    assert [event.xid for event in events] == [79]
+    [(hosts, since, xids)] = seen
+    assert (hosts, since) == (["gpu-node-7"], START)
+    # First sight, B200 NVLink first sight, and repeat Xids (design §4.2).
+    assert xids == [
+        46, 48, 54, 62, 64, 74, 79, 95, 109, 110, 119, 120, 136, 140, 143,
+        144, 145, 146, 147, 148, 149, 150, 157, 158, 171, 172,
+    ]
+
+
+def test_recent_gpu_hosts_reads_the_rollup_over_the_whole_window() -> None:
+    # gpu_snapshots holds one row per GPU every 30 s; over the 7-day roster
+    # window that read was the scan's slowest and failed first when the disk
+    # was saturated (07:20-07:40 UTC daily). The 5-minute rollup is written in
+    # the same reporter transaction, so it names the same hosts (30 of 30 on
+    # production, 2026-10-22) from a cached index. The window itself stays:
+    # it is the not-reporting roster.
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+
+    class RollupConnection(FakePostgresConnection):
+        def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Result:
+            seen.append((" ".join(sql.split()), params))
+            return Result(rows=[("h200-ci-1",), ("dgxb200-16",)])
+
+    store = PostgresAlertStore(lambda: RollupConnection())
+    hosts = store.recent_gpu_hosts(since=START - timedelta(days=7))
+
+    assert hosts == frozenset({"h200-ci-1", "dgxb200-16"})
+    assert seen == [
+        (
+            "SELECT DISTINCT hostname FROM gpu_history_5m WHERE time_bucket >= %s",
+            (START - timedelta(days=7),),
+        )
+    ]

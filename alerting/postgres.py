@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from alerting.analyzer import (
@@ -37,19 +37,27 @@ from alerting.infra import (
     DiskMountObservation,
     GpuCountObservation,
     GpuDeadMemoryObservation,
+    GpuFaultObservation,
     GpuTemperatureObservation,
+    HostFaultObservation,
     HostReport,
     InfraAlertEpisode,
+    normalize_hostname,
     InfraNotificationFactory,
     InfraScanPlan,
     InfraStateSnapshot,
     InfraSubjectState,
     InfraThreshold,
+    QuarantineDecision,
+    QuarantineStageChange,
+    TRIGGER_XIDS,
+    XidEvent,
 )
 from alerting.main_ci import (
     MainCIJobObservation,
     MainCILatestBuildRef,
     MainCIOpenAlertRef,
+    image_build_notice,
     ordered_unique_observations,
 )
 from alerting.main_ci_analysis import (
@@ -838,6 +846,31 @@ class PostgresAlertStore:
             processed_build_ids=frozenset(row[0] for row in rows),
         )
 
+    def _enqueue_image_build_notice(
+        self,
+        connection: Any,
+        *,
+        alert_id: int,
+        first_failure_build_number: int,
+        first_failure_build_url: str,
+        last_failure_build_number: int,
+        observation: MainCIJobObservation,
+        delivery_mode: DeliveryMode,
+        now: datetime,
+    ) -> None:
+        notice = image_build_notice(
+            alert_id=alert_id,
+            job_key=observation.job_key,
+            job_name=observation.job_name,
+            first_failure_build_number=first_failure_build_number,
+            first_failure_build_url=first_failure_build_url,
+            last_failure_build_number=last_failure_build_number,
+            observation=observation,
+            delivery_mode=delivery_mode,
+        )
+        if notice is not None:
+            self._enqueue(connection, notice, next_attempt_at=now)
+
     def main_ci_scan_cursor(self) -> datetime | None:
         with self._connection_factory() as connection:
             row = connection.execute(
@@ -856,6 +889,7 @@ class PostgresAlertStore:
         observations: list[MainCIJobObservation],
         scanned_through: datetime,
         now: datetime,
+        delivery_mode: DeliveryMode,
     ) -> None:
         with self._connection_factory() as connection:
             with connection.transaction():
@@ -882,6 +916,17 @@ class PostgresAlertStore:
                     ) >= observation.order:
                         continue
 
+                    # A job keeps its id when a change to how keys are built
+                    # (#209, #237) gives it a new key: move its row, or the
+                    # unique latest_job_id rejects the insert and the whole
+                    # reconcile fails.
+                    connection.execute(
+                        """
+                        DELETE FROM alerting_main_ci_job_states
+                        WHERE latest_job_id = %s AND job_key <> %s
+                        """,
+                        (observation.job_id, observation.job_key),
+                    )
                     connection.execute(
                         """
                         INSERT INTO alerting_main_ci_job_states (
@@ -933,7 +978,8 @@ class PostgresAlertStore:
                                 failure_count = failure_count + 1,
                                 updated_at = %s
                             WHERE job_key = %s AND status = 'open'
-                            RETURNING alert_id
+                            RETURNING alert_id, first_failure_build_number,
+                                      first_failure_build_url
                             """,
                             (
                                 observation.job_name,
@@ -949,7 +995,18 @@ class PostgresAlertStore:
                                 observation.job_key,
                             ),
                         ).fetchone()
-                        if updated is None:
+                        if updated is not None:
+                            self._enqueue_image_build_notice(
+                                connection,
+                                alert_id=updated[0],
+                                first_failure_build_number=updated[1],
+                                first_failure_build_url=updated[2],
+                                last_failure_build_number=observation.build_number,
+                                observation=observation,
+                                delivery_mode=delivery_mode,
+                                now=now,
+                            )
+                        else:
                             connection.execute(
                                 """
                                 INSERT INTO alerting_main_ci_job_alerts (
@@ -996,7 +1053,7 @@ class PostgresAlertStore:
                                 ),
                             )
                     else:
-                        connection.execute(
+                        resolved = connection.execute(
                             """
                             UPDATE alerting_main_ci_job_alerts
                             SET status = 'resolved', resolved_at = %s,
@@ -1008,6 +1065,9 @@ class PostgresAlertStore:
                                 resolution_commit_sha = %s,
                                 updated_at = %s
                             WHERE job_key = %s AND status = 'open'
+                            RETURNING alert_id, first_failure_build_number,
+                                      first_failure_build_url,
+                                      last_failure_build_number
                             """,
                             (
                                 observation.finished_at,
@@ -1020,7 +1080,18 @@ class PostgresAlertStore:
                                 now,
                                 observation.job_key,
                             ),
-                        )
+                        ).fetchone()
+                        if resolved is not None:
+                            self._enqueue_image_build_notice(
+                                connection,
+                                alert_id=resolved[0],
+                                first_failure_build_number=resolved[1],
+                                first_failure_build_url=resolved[2],
+                                last_failure_build_number=resolved[3],
+                                observation=observation,
+                                delivery_mode=delivery_mode,
+                                now=now,
+                            )
 
                 connection.execute(
                     """
@@ -1136,12 +1207,16 @@ class PostgresAlertStore:
         return [HostReport(hostname=row[0], reported_at=row[1]) for row in rows]
 
     def recent_gpu_hosts(self, *, since: datetime) -> frozenset[str]:
+        # The 5-minute rollup, not gpu_snapshots: the reporter writes both in
+        # one transaction, so they name the same hosts, but distinct over 7
+        # days of 30-second per-GPU rows read from disk and timed out first
+        # whenever the database's disk was saturated.
         with self._connection_factory() as connection:
             rows = connection.execute(
                 """
                 SELECT DISTINCT hostname
-                FROM gpu_snapshots
-                WHERE reported_at >= %s
+                FROM gpu_history_5m
+                WHERE time_bucket >= %s
                 """,
                 (since,),
             ).fetchall()
@@ -1214,10 +1289,12 @@ class PostgresAlertStore:
                        hostname, gpu_index, temperature_c, reported_at
                 FROM gpu_snapshots
                 -- Stale readings must not sustain temperature breaches (a
-                -- silent host is the unreporting alert's job), and the
-                -- bound keeps the scan off 8M+ rows of history.
+                -- silent host is the unreporting alert's job). The bound is
+                -- 15 minutes, as in gpu_counts: two days was ~1M rows sorted
+                -- on disk every scan and blew the statement timeout under
+                -- load.
                 WHERE temperature_c IS NOT NULL
-                  AND reported_at >= now() - interval '2 days'
+                  AND reported_at >= now() - interval '15 minutes'
                 ORDER BY hostname, gpu_index, reported_at DESC
                 """
             ).fetchall()
@@ -1239,10 +1316,10 @@ class PostgresAlertStore:
                        hostname, gpu_index, dead_proc_mem_mb, reported_at
                 FROM gpu_snapshots
                 -- Stale readings must not sustain breaches (a silent host is
-                -- the unreporting alert's job), and the bound keeps the scan
-                -- off 8M+ rows of history.
+                -- the unreporting alert's job). 15 minutes for the same
+                -- reason as gpu_temperatures.
                 WHERE dead_proc_mem_mb IS NOT NULL
-                  AND reported_at >= now() - interval '2 days'
+                  AND reported_at >= now() - interval '15 minutes'
                 ORDER BY hostname, gpu_index, reported_at DESC
                 """
             ).fetchall()
@@ -1282,6 +1359,238 @@ class PostgresAlertStore:
             )
             for row in rows
         ]
+
+    def gpu_faults(self) -> list[GpuFaultObservation]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ON (hostname, gpu_index)
+                       hostname, gpu_index, recovery_action,
+                       remapped_rows_failure, reported_at
+                FROM gpu_snapshots
+                -- Only a fresh reading can trip a rule (READING_MAX_AGE);
+                -- the bound keeps the scan on the newest rows, as in
+                -- gpu_counts.
+                WHERE reported_at >= now() - interval '10 minutes'
+                ORDER BY hostname, gpu_index, reported_at DESC
+                """
+            ).fetchall()
+        return [
+            GpuFaultObservation(
+                hostname=str(row[0]),
+                gpu_index=int(row[1]),
+                recovery_action=str(row[2]) if row[2] is not None else None,
+                remapped_rows_failure=bool(row[3]) if row[3] is not None else None,
+                reported_at=row[4],
+            )
+            for row in rows
+        ]
+
+    def host_faults(self) -> list[HostFaultObservation]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ON (hostname)
+                       hostname, gpu_query_hung, network_probes,
+                       root_owned_slots, reported_at, docker_ok, docker_error
+                FROM host_snapshots
+                -- Bounded for the same reason as gpu_faults.
+                WHERE reported_at >= now() - interval '10 minutes'
+                ORDER BY hostname, reported_at DESC
+                """
+            ).fetchall()
+        return [
+            HostFaultObservation(
+                hostname=str(row[0]),
+                gpu_query_hung=bool(row[1]) if row[1] is not None else None,
+                network_probes=list(row[2]) if row[2] is not None else None,
+                root_owned_slots=(
+                    [str(slot) for slot in row[3]] if row[3] is not None else None
+                ),
+                reported_at=row[4],
+                docker_ok=bool(row[5]) if row[5] is not None else None,
+                docker_error=str(row[6]) if row[6] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def xid_events(
+        self, *, hostnames: Iterable[str], since: datetime
+    ) -> list[XidEvent]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT hostname, bus_id, xid, at
+                FROM gpu_xid_events
+                -- idx_gpu_xid_events_host_at: one range per pilot host.
+                WHERE hostname = ANY(%s) AND at >= %s AND xid = ANY(%s)
+                ORDER BY hostname, at
+                """,
+                (list(hostnames), since, sorted(TRIGGER_XIDS)),
+            ).fetchall()
+        return [
+            XidEvent(
+                hostname=str(row[0]), bus_id=str(row[1]), xid=int(row[2]), at=row[3]
+            )
+            for row in rows
+        ]
+
+    def agent_queues(self) -> list[tuple[str, str]]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT hostname, queue
+                FROM buildkite_agent_snapshots, unnest(queues) AS queue
+                -- The dashboard's poll-metrics cron samples connected agents
+                -- every five minutes; three polls ride out one failure.
+                WHERE polled_at >= now() - interval '15 minutes'
+                  AND hostname IS NOT NULL
+                """
+            ).fetchall()
+        return [(str(row[0]), str(row[1])) for row in rows]
+
+    def episodes_since(self, since: datetime) -> list[InfraAlertEpisode]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT alert_id, alert_type, subject_key, opened_at,
+                       resolved_at, details
+                FROM alerting_infra_alerts
+                WHERE alert_type IN ('quarantine', 'gpu_count', 'unreporting')
+                  AND (status = 'open' OR opened_at >= %s OR resolved_at >= %s)
+                """,
+                (since, since),
+            ).fetchall()
+        return [
+            InfraAlertEpisode(
+                alert_id=int(row[0]),
+                alert_type=row[1],
+                subject_key=row[2],
+                opened_at=row[3],
+                resolved_at=row[4],
+                details=dict(row[5]),
+            )
+            for row in rows
+        ]
+
+    def expected_gpu_exceptions(self) -> dict[str, int]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                "SELECT host, expected_gpus FROM alerting_expected_gpu_exceptions"
+            ).fetchall()
+        return {str(row[0]).lower(): int(row[1]) for row in rows}
+
+    def scrape_buckets(self, since: datetime) -> dict[str, int]:
+        with self._connection_factory() as connection:
+            # gpu_history_5m, not gpu_snapshots: one row per host per bucket
+            # is two days of 288 rows per host instead of raw samples. A host
+            # counts once it has a bucket before the window, so one whose
+            # scrape was down for the window's start is still measured.
+            rows = connection.execute(
+                """
+                SELECT hostname,
+                       count(DISTINCT time_bucket) FILTER (WHERE time_bucket >= %s)
+                FROM gpu_history_5m
+                WHERE time_bucket >= %s
+                GROUP BY hostname
+                HAVING min(time_bucket) < %s
+                """,
+                (since, since - timedelta(days=1), since),
+            ).fetchall()
+        return {str(row[0]).lower(): int(row[1]) for row in rows}
+
+    def last_agent_queues(
+        self, hostnames: Iterable[str], suffixes: Iterable[str]
+    ) -> list[tuple[str, str]]:
+        # Candidate names for each host, lower case: short, and under each
+        # known domain. Each is one probe of
+        # idx_buildkite_agent_snapshots_lower_host (lower(hostname),
+        # polled_at DESC), so any spelling Buildkite stored matches, and the
+        # cost is the candidate count, not the table, which holds a hostname
+        # per CI pod agent.
+        candidates = sorted(
+            {
+                base.lower()
+                for host in hostnames
+                for base in (host, *(f"{host}.{suffix}" for suffix in suffixes))
+            }
+        )
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.name, newest.polled_at, queue
+                FROM unnest(%s::text[]) AS c(name)
+                CROSS JOIN LATERAL (
+                    SELECT polled_at, queues FROM buildkite_agent_snapshots
+                    WHERE lower(hostname) = c.name
+                    ORDER BY polled_at DESC LIMIT 1
+                ) newest,
+                unnest(newest.queues) AS queue
+                """,
+                (candidates,),
+            ).fetchall()
+        # Of the candidates that normalize to one host, keep the newest poll.
+        newest: dict[str, datetime] = {}
+        for name, polled_at, _ in rows:
+            key = normalize_hostname(str(name))
+            newest[key] = max(polled_at, newest.get(key, polled_at))
+        return [
+            (str(name), str(queue))
+            for name, polled_at, queue in rows
+            if polled_at == newest[normalize_hostname(str(name))]
+        ]
+
+    def allocatable_gpus(self) -> dict[str, tuple[int, int]]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ON (hostname)
+                       hostname, allocatable_gpus, capacity_gpus
+                FROM host_snapshots
+                -- Fresh readings only, as in host_faults; H200 hosts leave
+                -- both columns NULL.
+                WHERE reported_at >= now() - interval '10 minutes'
+                  AND allocatable_gpus IS NOT NULL
+                  AND capacity_gpus IS NOT NULL
+                ORDER BY hostname, reported_at DESC
+                """
+            ).fetchall()
+        return {str(row[0]).lower(): (int(row[1]), int(row[2])) for row in rows}
+
+    def cordoned_hosts(self) -> dict[str, datetime]:
+        with self._connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT latest.hostname, COALESCE(
+                    -- The cordon started in the first five-minute bucket
+                    -- after the node was last seen schedulable.
+                    (
+                        SELECT min(h.time_bucket) FROM host_history_5m h
+                        WHERE h.hostname = lower(latest.hostname)
+                          AND h.time_bucket > COALESCE(
+                              (
+                                  SELECT max(u.time_bucket) FROM host_history_5m u
+                                  WHERE u.hostname = lower(latest.hostname)
+                                    AND (u.node_conditions->>'unschedulable')::boolean IS FALSE
+                              ),
+                              '-infinity'
+                          )
+                    ),
+                    latest.reported_at
+                )
+                FROM (
+                    SELECT DISTINCT ON (hostname)
+                           hostname, reported_at, node_conditions
+                    FROM host_snapshots
+                    -- Only the k8s reporter sends node_conditions.
+                    WHERE reported_at >= now() - interval '10 minutes'
+                      AND node_conditions IS NOT NULL
+                    ORDER BY hostname, reported_at DESC
+                ) latest
+                WHERE (latest.node_conditions->>'unschedulable')::boolean
+                """
+            ).fetchall()
+        return {str(row[0]).lower(): row[1] for row in rows}
 
     def infra_state(self) -> InfraStateSnapshot:
         with self._connection_factory() as connection:
@@ -1406,10 +1715,37 @@ class PostgresAlertStore:
                     )
                     if updated.rowcount == 1:
                         resolved.append(episode)
+                # The dashboard writes these rows too (operator resolve,
+                # actuator reports), so a stage change merges only its own
+                # keys and applies only if the stage is still the one read.
+                changed: list[QuarantineStageChange] = []
+                for change in plan.stage_changes:
+                    episode = change.episode
+                    updated = connection.execute(
+                        """
+                        UPDATE alerting_infra_alerts
+                        SET status = %s, resolved_at = %s,
+                            details = details || %s::jsonb, updated_at = %s
+                        WHERE alert_type = %s AND subject_key = %s
+                          AND status = 'open' AND details->>'stage' = %s
+                        """,
+                        (
+                            episode.status,
+                            episode.resolved_at,
+                            json.dumps(change.patch),
+                            now,
+                            episode.alert_type,
+                            episode.subject_key,
+                            change.from_stage,
+                        ),
+                    )
+                    if updated.rowcount == 1:
+                        changed.append(change)
                 applied = InfraScanPlan(
                     states=plan.states,
                     opened=tuple(opened),
                     resolved=tuple(resolved),
+                    stage_changes=tuple(changed),
                 )
                 for message in notification_factory(applied):
                     self._enqueue(connection, message, next_attempt_at=now)
@@ -1971,6 +2307,7 @@ def build_main_ci_runtime(
     buildkite_token: str,
     slack: SlackPort,
     clock: Clock,
+    delivery_mode: DeliveryMode,
 ) -> AlertingRuntime:
     """Wire Main CI exact-job lifecycle reconciliation into the runtime."""
     from alerting.full_ci import BuildkiteRestClient
@@ -1978,7 +2315,9 @@ def build_main_ci_runtime(
 
     store = PostgresAlertStore.from_database_url(database_url)
     source = BuildkiteMainCISource(BuildkiteRestClient(token=buildkite_token))
-    handler = MainCIReconciliationHandler(source=source, store=store, clock=clock)
+    handler = MainCIReconciliationHandler(
+        source=source, store=store, clock=clock, delivery_mode=delivery_mode
+    )
     return AlertingRuntime(
         executions=store,
         outbox=store,
@@ -1995,6 +2334,7 @@ def build_main_ci_backstop_runtime(
     buildkite_token: str,
     slack: SlackPort,
     clock: Clock,
+    delivery_mode: DeliveryMode,
 ) -> AlertingRuntime:
     """Wire the hourly Main CI retry-resolution backstop into the runtime."""
     from alerting.full_ci import BuildkiteRestClient
@@ -2005,6 +2345,7 @@ def build_main_ci_backstop_runtime(
         builds=BuildkiteRestClient(token=buildkite_token),
         store=store,
         clock=clock,
+        delivery_mode=delivery_mode,
     )
     return AlertingRuntime(
         executions=store,
@@ -2023,8 +2364,12 @@ def build_infra_runtime(
     slack: SlackPort,
     clock: Clock,
     delivery_mode: DeliveryMode = DeliveryMode.LIVE,
+    quarantine_live: bool = False,
+    buildkite_token: str | None = None,
+    operator_destination: str | None = None,
 ) -> AlertingRuntime:
-    """Wire the infra health scan: optional kubectl nodes + Postgres.
+    """Wire the infra health scan: optional kubectl nodes + Postgres, and the
+    job-failure quarantine trigger when a Buildkite token is set.
 
     The expected-hosts roster is reporter-derived (see InfraScanHandler):
     the Buildkite gpu-queue agents list was dropped because the fleet's
@@ -2041,12 +2386,25 @@ def build_infra_runtime(
     hosts = UnionExpectedHostSource(
         [*(KubectlNodesSource(kubeconfig=path) for path in kubeconfigs)]
     )
+    job_failure_decisions = None
+    if buildkite_token:
+        from alerting.full_ci import BuildkiteRestClient
+        from alerting.job_failure_trigger import dry_run_decisions
+
+        buildkite = BuildkiteRestClient(token=buildkite_token)
+
+        def job_failure_decisions(now: datetime) -> list[QuarantineDecision]:
+            return dry_run_decisions(buildkite, now=now)
+
     handler = InfraScanHandler(
         hosts=hosts,
         snapshots=store,
         store=store,
         clock=clock,
         delivery_mode=delivery_mode,
+        job_failure_decisions=job_failure_decisions,
+        quarantine_live=quarantine_live,
+        operator_destination=operator_destination,
     )
     return AlertingRuntime(
         executions=store,
@@ -2054,6 +2412,39 @@ def build_infra_runtime(
         slack=slack,
         clock=clock,
         handlers={"infra_scan": handler},
+        alert_path=AlertPath.INFRA,
+    )
+
+
+def build_daily_summary_runtime(
+    *,
+    database_url: str,
+    destination: str,
+    slack: SlackPort,
+    clock: Clock,
+    delivery_mode: DeliveryMode = DeliveryMode.LIVE,
+    quarantine_live: bool = False,
+) -> AlertingRuntime:
+    """Wire the daily infra summary: Postgres reads, one outbox post."""
+    from alerting.daily_summary import DailySummaryHandler
+
+    store = PostgresAlertStore.from_database_url(database_url)
+    handler = DailySummaryHandler(
+        source=store,
+        snapshots=store,
+        store=store,
+        outbox=store,
+        clock=clock,
+        destination=destination,
+        delivery_mode=delivery_mode,
+        quarantine_live=quarantine_live,
+    )
+    return AlertingRuntime(
+        executions=store,
+        outbox=store,
+        slack=slack,
+        clock=clock,
+        handlers={"daily_summary": handler},
         alert_path=AlertPath.INFRA,
     )
 

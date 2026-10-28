@@ -11,6 +11,7 @@ from pathlib import Path
 from alerting.commands import ScheduledCommand
 from alerting.ports import Clock, DeliveryMode
 from alerting.postgres import (
+    build_daily_summary_runtime,
     build_fast_ci_runtime,
     build_full_ci_analysis_runtime,
     build_full_ci_runtime,
@@ -54,6 +55,15 @@ def _delivery_mode() -> DeliveryMode:
         return DeliveryMode(raw)
     except ValueError as exc:
         raise RuntimeError("ALERTING_DELIVERY_MODE must be 'shadow' or 'live'") from exc
+
+
+def _quarantine_live() -> bool:
+    # Dry run unless explicitly switched: quarantines are recorded and posted
+    # as 'would', and the actuators only log them.
+    raw = os.environ.get("QUARANTINE_MODE", "dry_run")
+    if raw not in ("dry_run", "live"):
+        raise RuntimeError("QUARANTINE_MODE must be 'dry_run' or 'live'")
+    return raw == "live"
 
 
 def _runtime(
@@ -110,6 +120,7 @@ def _runtime(
             buildkite_token=_required_environment("BUILDKITE_TOKEN"),
             slack=_slack(),
             clock=clock,
+            delivery_mode=delivery_mode,
         )
     if consumer == "main-ci-backstop":
         return build_main_ci_backstop_runtime(
@@ -117,6 +128,7 @@ def _runtime(
             buildkite_token=_required_environment("BUILDKITE_TOKEN"),
             slack=_slack(),
             clock=clock,
+            delivery_mode=delivery_mode,
         )
     if consumer == "infra":
         # kubectl node-list sources are optional: the worker's security group
@@ -140,6 +152,24 @@ def _runtime(
             slack=_slack(),
             clock=clock,
             delivery_mode=delivery_mode,
+            quarantine_live=_quarantine_live(),
+            # Optional like the kubeconfigs: unset skips the job-failure
+            # trigger, and its fetch failing never fails the scan.
+            buildkite_token=os.environ.get("BUILDKITE_TOKEN"),
+            # Quarantine events that need a person go here too: the same DM
+            # the worker-failure alert uses.
+            operator_destination=os.environ.get("ALERTING_FAILURE_SLACK_DESTINATION"),
+        )
+    if consumer == "daily-summary":
+        # The infra alert channel; a DM to the worker-failure destination if unset.
+        return build_daily_summary_runtime(
+            database_url=database_url,
+            destination=os.environ.get("SLACK_CI_INFRA_ALERT_CHANNEL")
+            or _required_environment("ALERTING_FAILURE_SLACK_DESTINATION"),
+            slack=_slack(),
+            clock=clock,
+            delivery_mode=delivery_mode,
+            quarantine_live=_quarantine_live(),
         )
     if consumer == "main-ci-analyze":
         return build_main_ci_analysis_runtime(
@@ -180,6 +210,7 @@ def scheduled_command(consumer: str, target_time: datetime) -> ScheduledCommand:
         "main-ci-backstop": "main_ci_backstop",
         "main-ci-analyze": "main_ci_analyze",
         "infra": "infra_scan",
+        "daily-summary": "daily_summary",
     }
     try:
         command_type = command_types[consumer]
@@ -199,6 +230,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "main-ci-backstop",
         "main-ci-analyze",
         "infra",
+        "daily-summary",
     }:
         return 2
 

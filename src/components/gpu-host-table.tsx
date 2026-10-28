@@ -111,6 +111,18 @@ function RamBackedBadge() {
   );
 }
 
+/** Marks MIG hosts, whose utilization is slice engine activity from DCGM. */
+function MigBadge({ slices }: { slices: number }) {
+  return (
+    <span
+      title={`${slices} MIG slices. Utilization is the average graphics-engine activity of each GPU's slices, read from DCGM.`}
+      className="ml-1.5 rounded bg-sky-100 px-1 py-0.5 text-[10px] font-medium whitespace-nowrap text-sky-700 dark:bg-sky-900/40 dark:text-sky-400"
+    >
+      MIG
+    </span>
+  );
+}
+
 function mountLabel(disk: NormalizedDiskMetric): string {
   return disk.mount_point ?? disk.device ?? "unknown";
 }
@@ -319,7 +331,7 @@ function HostDrillDown({ row, host }: { row: HostRow; host: HostLatest | undefin
                     >
                       <td className="py-1.5 pr-4 font-medium">GPU {gpu.index}</td>
                       <td className="py-1.5 pr-4 tabular-nums">
-                        {Math.round(gpu.gpuUtil)}%
+                        {gpu.gpuUtil == null ? <EmptyMetric /> : `${Math.round(gpu.gpuUtil)}%`}
                       </td>
                       <td className="py-1.5 pr-4 tabular-nums">
                         {formatMemory(gpu.memUsedMb)} /{" "}
@@ -431,8 +443,6 @@ export function GpuHostTable({
             {sortedRows.map((h) => {
               const host = hostsByName.get(h.hostname);
               const agent = agents?.get(h.hostname);
-              const gpuUtil =
-                h.gpuCount > 0 ? Math.round(h.gpuUtil / h.gpuCount) : 0;
               const ago =
                 now > 0
                   ? Math.round((now - new Date(h.lastSeen).getTime()) / 60_000)
@@ -502,9 +512,12 @@ export function GpuHostTable({
                         </div>
                       )}
                     </td>
-                    <td className="px-5 py-3.5 sm:px-6">{h.gpuType}</td>
                     <td className="px-5 py-3.5 sm:px-6">
-                      <Meter value={gpuUtil} />
+                      {h.gpuType}
+                      {host?.mig_slices ? <MigBadge slices={host.mig_slices} /> : null}
+                    </td>
+                    <td className="px-5 py-3.5 sm:px-6">
+                      {h.gpuUtil == null ? <EmptyMetric /> : <Meter value={h.gpuUtil} />}
                     </td>
                     <td className="whitespace-nowrap px-5 py-3.5 tabular-nums sm:px-6">
                       <span
@@ -551,7 +564,8 @@ export function GpuHostTable({
                                   {formatMemory(gpu.memUsedMb)} / {formatMemory(gpu.memTotalMb)} ({pct}%)
                                 </span>
                                 <span className="block text-zinc-400">
-                                  GPU utilization: {Math.round(gpu.gpuUtil)}%
+                                  GPU utilization:{" "}
+                                  {gpu.gpuUtil == null ? "not reported" : `${Math.round(gpu.gpuUtil)}%`}
                                 </span>
                                 <span className="block text-zinc-400">
                                   Temp: {formatTemperature(gpu.temperatureC)}
